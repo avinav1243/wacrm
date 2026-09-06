@@ -59,10 +59,13 @@ import { GatedButton } from '@/components/ui/gated-button';
 import { useTranslations } from 'next-intl';
 
 const PAGE_SIZE = 25;
+const BULK_DELETE_BATCH_SIZE = 500;
 
 interface ContactWithTags extends Contact {
   tags?: Tag[];
 }
+
+type BulkDeleteScope = 'selected' | 'scope';
 
 export default function ContactsPage() {
   const t = useTranslations('Contacts.page');
@@ -92,6 +95,7 @@ export default function ContactsPage() {
 
   // Bulk selection (page-scoped — only the loaded rows are selectable)
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkDeleteScope, setBulkDeleteScope] = useState<BulkDeleteScope | null>(null);
   const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
 
   // All tags for display
@@ -214,12 +218,10 @@ export default function ContactsPage() {
   // synchronously in the effect body, so the cascade the lint rule
   // warns about doesn't apply here.
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchTags();
   }, [fetchTags]);
 
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchContacts();
   }, [fetchContacts]);
 
@@ -249,6 +251,18 @@ export default function ContactsPage() {
     setDeleteConfirmOpen(true);
   }
 
+  function openBulkDelete(scope: BulkDeleteScope) {
+    setBulkDeleteScope(scope);
+    setBulkDeleteOpen(true);
+  }
+
+  function closeBulkDelete(open: boolean) {
+    setBulkDeleteOpen(open);
+    if (!open) {
+      setBulkDeleteScope(null);
+    }
+  }
+
   async function handleDelete() {
     if (!deleteTarget) return;
     setDeleting(true);
@@ -268,6 +282,75 @@ export default function ContactsPage() {
     setDeleting(false);
     setDeleteConfirmOpen(false);
     setDeleteTarget(null);
+  }
+
+  async function loadBulkDeleteIds(scope: BulkDeleteScope) {
+    if (scope === 'selected') {
+      return [...selected];
+    }
+
+    const ids: string[] = [];
+    const term = search.trim();
+
+    if (selectedTagIds.length > 0) {
+      for (let offset = 0; ; offset += BULK_DELETE_BATCH_SIZE) {
+        const { data, error } = await supabase.rpc('filter_contacts_by_tags', {
+          p_tag_ids: selectedTagIds,
+          p_search: term || null,
+          p_limit: BULK_DELETE_BATCH_SIZE,
+          p_offset: offset,
+        });
+        if (error) {
+          throw new Error(error.message);
+        }
+
+        const rows = (data ?? []) as { contact: Pick<Contact, 'id'>; total_count: number }[];
+        ids.push(...rows.map((row) => row.contact.id));
+
+        if (rows.length < BULK_DELETE_BATCH_SIZE) {
+          break;
+        }
+      }
+
+      return ids;
+    }
+
+    for (let offset = 0; ; offset += BULK_DELETE_BATCH_SIZE) {
+      let query = supabase
+        .from('contacts')
+        .select('id')
+        .order('created_at', { ascending: false })
+        .range(offset, offset + BULK_DELETE_BATCH_SIZE - 1);
+
+      if (term) {
+        const like = `%${term}%`;
+        query = query.or(`name.ilike.${like},phone.ilike.${like},email.ilike.${like}`);
+      }
+
+      const { data, error } = await query;
+      if (error) {
+        throw new Error(error.message);
+      }
+
+      const rows = (data ?? []) as Array<Pick<Contact, 'id'>>;
+      ids.push(...rows.map((row) => row.id));
+
+      if (rows.length < BULK_DELETE_BATCH_SIZE) {
+        break;
+      }
+    }
+
+    return ids;
+  }
+
+  async function deleteContactsByIds(ids: string[]) {
+    for (let index = 0; index < ids.length; index += BULK_DELETE_BATCH_SIZE) {
+      const chunk = ids.slice(index, index + BULK_DELETE_BATCH_SIZE);
+      const { error } = await supabase.from('contacts').delete().in('id', chunk);
+      if (error) {
+        throw new Error(error.message);
+      }
+    }
   }
 
   const allOnPageSelected =
@@ -296,22 +379,27 @@ export default function ContactsPage() {
   }
 
   async function handleBulkDelete() {
-    const ids = [...selected];
-    if (ids.length === 0) return;
+    if (!bulkDeleteScope) return;
     setDeleting(true);
+    try {
+      const ids = await loadBulkDeleteIds(bulkDeleteScope);
+      if (ids.length === 0) {
+        throw new Error('No contacts to delete');
+      }
 
-    const { error } = await supabase.from('contacts').delete().in('id', ids);
+      await deleteContactsByIds(ids);
 
-    if (error) {
-      toast.error(t('toastBulkFailedDelete'));
-    } else {
       toast.success(t('toastBulkDeleted', { count: ids.length }));
-      setSelected(new Set());
+      if (bulkDeleteScope === 'selected') {
+        setSelected(new Set());
+      }
       fetchContacts();
+    } catch {
+      toast.error(t('toastBulkFailedDelete'));
+    } finally {
+      setDeleting(false);
+      closeBulkDelete(false);
     }
-
-    setDeleting(false);
-    setBulkDeleteOpen(false);
   }
 
   const totalPages = Math.ceil(totalCount / PAGE_SIZE);
@@ -460,6 +548,18 @@ export default function ContactsPage() {
               )}
             </PopoverContent>
           </Popover>
+
+          <GatedButton
+            variant="destructive"
+            canAct={canEdit}
+            gateReason="delete contacts"
+            onClick={() => openBulkDelete('scope')}
+            disabled={loading || deleting || totalCount === 0}
+            className="shrink-0"
+          >
+            <Trash2 className="size-4" />
+            {hasActiveFilters ? t('deleteFiltered') : t('deleteAll')}
+          </GatedButton>
         </div>
 
         {/* Active tag-filter chips */}
@@ -518,7 +618,7 @@ export default function ContactsPage() {
               size="sm"
               canAct={canEdit}
               gateReason="delete contacts"
-              onClick={() => setBulkDeleteOpen(true)}
+              onClick={() => openBulkDelete('selected')}
             >
               <Trash2 className="size-4" />
               {t('deleteSelected')}
@@ -798,20 +898,28 @@ export default function ContactsPage() {
       </Dialog>
 
       {/* Bulk Delete Confirmation */}
-      <Dialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
+      <Dialog open={bulkDeleteOpen} onOpenChange={closeBulkDelete}>
         <DialogContent className="bg-popover border-border text-popover-foreground sm:max-w-sm">
           <DialogHeader>
             <DialogTitle className="text-popover-foreground">
-              {t('deleteBulkTitle')}
+              {bulkDeleteScope === 'selected'
+                ? t('deleteBulkTitle')
+                : hasActiveFilters
+                  ? t('deleteFilteredTitle')
+                  : t('deleteAllTitle')}
             </DialogTitle>
             <DialogDescription className="text-muted-foreground">
-              {t('deleteBulkDesc', { count: selected.size })}
+              {bulkDeleteScope === 'selected'
+                ? t('deleteBulkDesc', { count: selected.size })
+                : hasActiveFilters
+                  ? t('deleteFilteredDesc', { count: totalCount })
+                  : t('deleteAllDesc', { count: totalCount })}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter className="bg-popover border-border">
             <Button
               variant="outline"
-              onClick={() => setBulkDeleteOpen(false)}
+              onClick={() => closeBulkDelete(false)}
               className="border-border text-muted-foreground hover:bg-muted"
             >
               {t('cancel')}

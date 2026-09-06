@@ -82,6 +82,8 @@ interface NavItem {
   href: string;
   labelKey: string;
   icon: typeof LayoutDashboard;
+  icon: typeof MessageSquare;
+  roles?: AccountRole[];
   /**
    * When true, the nav row renders a small "Beta" chip after the label.
    * Purely informational — doesn't affect routing or access.
@@ -99,6 +101,7 @@ const navItems: NavItem[] = [
   { href: "/automations", labelKey: "automations", icon: Zap },
   { href: "/flows", labelKey: "flows", icon: Workflow, beta: true },
   { href: "/agents", labelKey: "aiAgents", icon: Bot },
+  { href: "/owner-dashboard", labelKey: "ownerDashboard", icon: Crown, roles: ["owner"] },
 ];
 
 const bottomNavItems = [
@@ -209,9 +212,11 @@ export function Sidebar({ open = false, onClose }: SidebarProps) {
         <nav className="flex-1 overflow-y-auto px-3 py-4">
           <ul className="flex flex-col gap-1">
             {navItems.map((item) => {
+              if (item.roles && (!accountRole || !item.roles.includes(accountRole))) {
+                return null;
+              }
               const isActive =
-                pathname === item.href ||
-                (item.href !== "/dashboard" && pathname.startsWith(item.href));
+                pathname === item.href || pathname.startsWith(item.href);
 
               const showUnreadDot =
                 item.href === "/inbox" && totalUnread > 0 && !isActive;

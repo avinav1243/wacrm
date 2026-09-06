@@ -10,7 +10,11 @@ export interface ParsedContactRow {
   company?: string;
   /** Tag names from the optional `tags` column (comma/semicolon separated). */
   tagNames: string[];
+  /** Any non-built-in CSV columns become custom field values. */
+  customFields: Record<string, string>;
 }
+
+const BUILTIN_COLUMNS = new Set(['phone', 'name', 'email', 'company', 'tags']);
 
 /** Split a CSV cell into unique tag names (case-insensitive de-dupe). */
 export function parseTagCell(value: string | undefined): string[] {
@@ -44,6 +48,10 @@ export interface ParseContactCsvResult {
   hasTagsColumn: boolean;
   /** True when the CSV header includes a `company` column. */
   hasCompanyColumn: boolean;
+  /** True when the CSV includes at least one custom-field column. */
+  hasCustomFieldsColumn: boolean;
+  /** Custom-field column names discovered in the header. */
+  customFieldNames: string[];
 }
 
 export function parseContactCsv(text: string): ParseContactCsvResult {
@@ -54,6 +62,8 @@ export function parseContactCsv(text: string): ParseContactCsvResult {
       hasPhoneColumn: false,
       hasTagsColumn: false,
       hasCompanyColumn: false,
+      hasCustomFieldsColumn: false,
+      customFieldNames: [],
     };
   }
 
@@ -68,6 +78,8 @@ export function parseContactCsv(text: string): ParseContactCsvResult {
       hasPhoneColumn: false,
       hasTagsColumn: false,
       hasCompanyColumn: false,
+      hasCustomFieldsColumn: false,
+      customFieldNames: [],
     };
   }
 
@@ -75,6 +87,10 @@ export function parseContactCsv(text: string): ParseContactCsvResult {
   const emailIdx = headers.indexOf('email');
   const companyIdx = headers.indexOf('company');
   const tagsIdx = headers.indexOf('tags');
+  const customFieldEntries = headers
+    .map((header, index) => ({ header, index }))
+    .filter(({ header }) => !BUILTIN_COLUMNS.has(header));
+  const customFieldNames = customFieldEntries.map(({ header }) => header);
 
   const rows: ParsedContactRow[] = [];
 
@@ -102,6 +118,12 @@ export function parseContactCsv(text: string): ParseContactCsvResult {
           : undefined,
       tagNames:
         tagsIdx >= 0 ? parseTagCell(values[tagsIdx]?.replace(/["']/g, '')) : [],
+      customFields: Object.fromEntries(
+        customFieldEntries.flatMap(({ header, index }) => {
+          const value = values[index]?.replace(/["']/g, '').trim();
+          return value ? [[header, value]] : [];
+        })
+      ),
     });
   }
 
@@ -110,6 +132,8 @@ export function parseContactCsv(text: string): ParseContactCsvResult {
     hasPhoneColumn: true,
     hasTagsColumn: tagsIdx >= 0,
     hasCompanyColumn: companyIdx >= 0,
+    hasCustomFieldsColumn: customFieldEntries.length > 0,
+    customFieldNames,
   };
 }
 
