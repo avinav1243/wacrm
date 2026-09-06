@@ -65,3 +65,24 @@ export interface ActivityItem {
   /** Optional deep-link for the whole row (not all items have a target). */
   href?: string
 }
+
+export type OwnerMessageStatus = 'sent' | 'delivered' | 'failed'
+
+export type OwnerMessageCategory = 'marketing' | 'utilityAuthentication'
+
+export interface OwnerMessageCategoryCounts {
+  sent: number
+  delivered: number
+  failed: number
+  total: number
+}
+
+export interface OwnerMessageReport {
+  range: {
+    start: string
+    end: string
+  }
+  totals: OwnerMessageCategoryCounts
+  marketing: OwnerMessageCategoryCounts
+  utilityAuthentication: OwnerMessageCategoryCounts
+}
