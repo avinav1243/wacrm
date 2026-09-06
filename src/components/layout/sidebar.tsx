@@ -81,7 +81,6 @@ import {
 interface NavItem {
   href: string;
   labelKey: string;
-  icon: typeof LayoutDashboard;
   icon: typeof MessageSquare;
   roles?: AccountRole[];
   /**
