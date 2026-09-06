@@ -12,7 +12,7 @@ type BroadcastRow = {
   delivered_count: number | null
   failed_count: number | null
   template_name: string | null
-  created_at: string
+  updated_at: string
 }
 
 type TemplateRow = {
@@ -97,14 +97,15 @@ export async function loadOwnerMessageReport(
   const start = range.start.toISOString()
   const endExclusive = new Date(range.end)
   endExclusive.setDate(endExclusive.getDate() + 1)
+  const activityTimestampColumn = 'updated_at'
 
   const [broadcastsRes, templatesRes] = await Promise.all([
     db
       .from('broadcasts')
-      .select('template_name, created_at, delivered_count, failed_count')
-      .gte('created_at', start)
-      .lt('created_at', endExclusive.toISOString())
-      .order('created_at', { ascending: true }),
+      .select('template_name, updated_at, delivered_count, failed_count')
+      .gte(activityTimestampColumn, start)
+      .lt(activityTimestampColumn, endExclusive.toISOString())
+      .order(activityTimestampColumn, { ascending: true }),
     db.from('message_templates').select('name, category'),
   ])
 

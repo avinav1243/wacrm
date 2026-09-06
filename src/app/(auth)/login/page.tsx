@@ -16,6 +16,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { MessageSquare, UsersRound } from "lucide-react";
+import { getLandingPath } from "@/lib/auth/landing";
 
 // `useSearchParams` opts the component out of static prerendering
 // unless it sits under a Suspense boundary. We split the form into
@@ -49,7 +50,7 @@ function LoginPageInner() {
     setError(null);
     setLoading(true);
 
-    const { error } = await supabase.auth.signInWithPassword({
+    const { data, error } = await supabase.auth.signInWithPassword({
       email,
       password,
     });
@@ -68,9 +69,19 @@ function LoginPageInner() {
     // back to /login — which looks like the page "just refreshing"
     // instead of signing in (issue #365). Mirrors the deliberate full
     // reload the invite-accept flow already uses in join/[token].
-    const destination = inviteToken
+    let destination = inviteToken
       ? `/join/${encodeURIComponent(inviteToken)}`
-      : "/dashboard";
+      : "/broadcasts";
+
+    if (!inviteToken && data.user?.id) {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("account_role")
+        .eq("user_id", data.user.id)
+        .maybeSingle();
+      destination = getLandingPath(profile?.account_role as "owner" | "admin" | "agent" | "viewer" | null);
+    }
+
     window.location.href = destination;
   };
 
