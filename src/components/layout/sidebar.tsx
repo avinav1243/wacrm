@@ -76,7 +76,8 @@ import {
 interface NavItem {
   href: string;
   labelKey: string;
-  icon: typeof LayoutDashboard;
+  icon: typeof MessageSquare;
+  roles?: AccountRole[];
   /**
    * When true, the nav row renders a small "Beta" chip after the label.
    * Purely informational — doesn't affect routing or access.
