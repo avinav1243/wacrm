@@ -9,6 +9,7 @@ import type {
 type DB = SupabaseClient
 
 type BroadcastRow = {
+  sent_count: number | null
   delivered_count: number | null
   failed_count: number | null
   template_name: string | null
@@ -67,9 +68,9 @@ export function buildOwnerMessageReport(
   const report = createEmptyOwnerMessageReport(range)
 
   for (const row of messages) {
+    const sent = row.sent_count ?? 0
     const delivered = row.delivered_count ?? 0
     const failed = row.failed_count ?? 0
-    const sent = delivered + failed
     if (sent === 0) continue
 
     addCount(report.totals, 'sent', sent)
@@ -102,7 +103,7 @@ export async function loadOwnerMessageReport(
   const [broadcastsRes, templatesRes] = await Promise.all([
     db
       .from('broadcasts')
-      .select('template_name, updated_at, delivered_count, failed_count')
+      .select('template_name, updated_at, sent_count, delivered_count, failed_count')
       .gte(activityTimestampColumn, start)
       .lt(activityTimestampColumn, endExclusive.toISOString())
       .order(activityTimestampColumn, { ascending: true }),
