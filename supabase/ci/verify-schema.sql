@@ -42,6 +42,24 @@ BEGIN
     RAISE EXCEPTION 'public.accounts is missing — migration 017 did not apply';
   END IF;
 
+  -- Message credits (040) — tables, top-up RPC, and the send-debit trigger.
+  IF to_regclass('public.message_credits') IS NULL THEN
+    RAISE EXCEPTION 'public.message_credits is missing — migration 040 did not apply';
+  END IF;
+  IF to_regclass('public.message_credit_transactions') IS NULL THEN
+    RAISE EXCEPTION 'public.message_credit_transactions is missing — migration 040 did not apply';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_proc WHERE proname = 'owner_add_credits'
+  ) THEN
+    RAISE EXCEPTION 'owner_add_credits() is missing — migration 040 did not apply';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_trigger WHERE tgname = 'broadcast_recipient_credit_debit'
+  ) THEN
+    RAISE EXCEPTION 'broadcast_recipient_credit_debit trigger is missing — migration 040 did not apply';
+  END IF;
+
   RAISE NOTICE 'schema verification passed';
 END
 $$;

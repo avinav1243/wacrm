@@ -13,12 +13,14 @@ import {
   LogOut,
   MessageSquare,
   Radio,
+  Receipt,
   Settings,
   Shield,
   User,
   UserCog,
   Users,
   UsersRound,
+  Wallet,
   X,
 } from "lucide-react";
 import type { AccountRole } from "@/lib/auth/roles";
@@ -90,7 +92,9 @@ const navItems: NavItem[] = [
   { href: "/notifications", labelKey: "notifications", icon: Bell },
   { href: "/contacts", labelKey: "contacts", icon: Users },
   { href: "/broadcasts", labelKey: "broadcasts", icon: Radio },
+  { href: "/credits", labelKey: "credits", icon: Receipt },
   { href: "/owner-dashboard", labelKey: "ownerDashboard", icon: Crown, roles: ["owner"] },
+  { href: "/owner-credits", labelKey: "ownerCredits", icon: Wallet, roles: ["owner"] },
 ];
 
 const bottomNavItems = [

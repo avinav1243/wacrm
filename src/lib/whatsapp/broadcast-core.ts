@@ -29,6 +29,7 @@ import {
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import type { MessageTemplate } from '@/types';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
+import { fetchCategoryBalance, isCreditCategory } from '@/lib/credits/credits';
 
 /** Thrown by createBroadcast on a caller-visible failure; route maps it. */
 export class BroadcastError extends Error {
@@ -181,6 +182,23 @@ export async function createBroadcast(
       'No recipients had a valid E.164 phone number',
       400
     );
+  }
+
+  // Credit gate — one credit is spent per recipient that reaches 'sent'.
+  // Hard-block before persisting anything if the deduped audience exceeds
+  // the available balance for this template's category (the bucket maps
+  // 1:1 to category). Retries are charged on the '→ sent' transition and
+  // are not re-gated here.
+  const creditCategory = templateRow?.category;
+  if (isCreditCategory(creditCategory)) {
+    const balance = await fetchCategoryBalance(db, accountId, creditCategory);
+    if (deduped.length > balance) {
+      throw new BroadcastError(
+        'payment_required',
+        `Insufficient ${creditCategory} credits: ${deduped.length} recipients, ${balance} available`,
+        402
+      );
+    }
   }
 
   // Persist the broadcast + its recipients. The count columns

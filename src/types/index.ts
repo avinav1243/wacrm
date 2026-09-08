@@ -348,6 +348,46 @@ export interface MessageTemplate {
   created_at: string;
 }
 
+// ============================================================
+// Message credits (migration 040)
+// ============================================================
+
+/**
+ * The three independent credit buckets. Aligned 1:1 with
+ * `MessageTemplate.category` — the bucket a broadcast draws from is
+ * exactly its template's category, no mapping layer.
+ */
+export type MessageCreditCategory = 'Marketing' | 'Utility' | 'Authentication';
+
+/** Balance row — one per (account, category). */
+export interface MessageCredit {
+  account_id: string;
+  category: MessageCreditCategory;
+  balance: number;
+  updated_at: string;
+}
+
+export type MessageCreditReason = 'manual_topup' | 'sent_debit';
+
+/**
+ * Append-only ledger row. `delta` is positive for a top-up, −1 for a
+ * send debit; `note` carries the owner's comment on a `manual_topup`
+ * and the broadcast name on a `sent_debit`.
+ */
+export interface MessageCreditTransaction {
+  id: string;
+  account_id: string;
+  category: MessageCreditCategory;
+  delta: number;
+  balance_after: number;
+  reason: MessageCreditReason;
+  note: string | null;
+  broadcast_id: string | null;
+  broadcast_recipient_id: string | null;
+  created_by: string | null;
+  created_at: string;
+}
+
 export interface Pipeline {
   id: string;
   user_id: string;

@@ -8,6 +8,7 @@ import {
   batchRetryDelayMs,
 } from '@/lib/broadcast-retry';
 import { normalizeKey } from '@/lib/contacts/dedupe';
+import { fetchCategoryBalance, isCreditCategory } from '@/lib/credits/credits';
 import { Contact, MessageTemplate } from '@/types';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
@@ -373,6 +374,21 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
 
       if (contacts.length === 0) {
         throw new Error('No contacts found for this audience.');
+      }
+
+      // ── Step 1b: Credit gate ──────────────────────────────────────
+      // A credit is spent per recipient that reaches 'sent'. Hard-block
+      // here if the audience is larger than the available balance for
+      // this template's category, so we never commit a broadcast we
+      // can't fully pay for. Category maps 1:1 to the credit bucket.
+      const category = payload.template.category;
+      if (isCreditCategory(category)) {
+        const balance = await fetchCategoryBalance(supabase, accountId, category);
+        if (contacts.length > balance) {
+          throw new Error(
+            `Insufficient ${category} credits: ${contacts.length} recipients but only ${balance} available. Ask your account owner to top up.`,
+          );
+        }
       }
 
       // ── Step 2: Create broadcast row ──────────────────────────────

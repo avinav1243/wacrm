@@ -39,7 +39,9 @@
     "menuProfile": "Profile",
     "menuSettings": "Settings",
     "menuSignOut": "Sign out",
-    "ownerDashboard": "Owner Dashboard"
+    "ownerDashboard": "Owner Dashboard",
+    "credits": "Credits",
+    "ownerCredits": "Manage Credits"
   },
   "Header": {
     "dashboard": "Dashboard",
@@ -813,7 +815,9 @@
         "sending": "Sending...",
         "preparing": "Preparing...",
         "progressDesc": "Processing {current} of {total} recipients...",
-        "toastFailedPreview": "Failed to load preview data"
+        "toastFailedPreview": "Failed to load preview data",
+        "creditsAvailable": "{category} credits",
+        "insufficientCredits": "Insufficient {category} credits: {reach} recipients but only {balance} available. Ask your account owner to top up."
       }
     }
   },
@@ -1773,6 +1777,59 @@
       "loadFailed": "Unable to load the owner report right now.",
       "retry": "Retry",
       "emptyState": "Nothing here yet."
+    }
+  },
+  "OwnerCredits": {
+    "manage": {
+      "title": "Manage Credits",
+      "description": "Top up each message-credit bucket. Credits are spent one per recipient a broadcast successfully sends.",
+      "balancesTitle": "Current balances",
+      "marketing": "Marketing",
+      "utility": "Utility",
+      "authentication": "Authentication",
+      "creditsUnit": "credits",
+      "topUpTitle": "Add credits",
+      "categoryLabel": "Category",
+      "amountLabel": "Amount",
+      "amountPlaceholder": "e.g. 1000",
+      "commentLabel": "Comment (optional)",
+      "commentPlaceholder": "e.g. invoice #123 / prepaid Q3",
+      "submit": "Add credits",
+      "submitting": "Adding...",
+      "toastSuccess": "Added {amount} {category} credits.",
+      "toastError": "Could not add credits.",
+      "invalidAmount": "Enter a positive whole number.",
+      "recentActivity": "Recent activity",
+      "viewAll": "View all transactions",
+      "loadFailed": "Unable to load balances right now."
+    },
+    "history": {
+      "title": "Credit transactions",
+      "description": "Every top-up and send debit for your account.",
+      "balancesTitle": "Current balances",
+      "marketing": "Marketing",
+      "utility": "Utility",
+      "authentication": "Authentication",
+      "creditsUnit": "credits",
+      "colDate": "Date",
+      "colCategory": "Category",
+      "colType": "Type",
+      "colAmount": "Amount",
+      "colBalance": "Balance",
+      "colDetails": "Details",
+      "typeCredit": "Credit",
+      "typeDebit": "Debit",
+      "filterType": "Type",
+      "filterTypeAll": "All types",
+      "filterTypeCredits": "Credits",
+      "filterTypeDebits": "Debits",
+      "filterCategory": "Category",
+      "filterCategoryAll": "All categories",
+      "manualTopUp": "Manual top-up",
+      "sentDebit": "Broadcast send",
+      "viewBroadcast": "View broadcast",
+      "empty": "No transactions yet.",
+      "loadFailed": "Unable to load transactions right now."
     }
   }
 }

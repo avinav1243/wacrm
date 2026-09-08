@@ -2,7 +2,9 @@
 
 import { useEffect, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchCategoryBalance, isCreditCategory } from '@/lib/credits/credits';
 import { MessageTemplate } from '@/types';
+import { useAuth } from '@/hooks/use-auth';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -47,9 +49,15 @@ export function Step4ScheduleSend({
   progress,
 }: Step4Props) {
   const t = useTranslations('Broadcasts.wizard');
+  const { accountId } = useAuth();
   const [showConfirm, setShowConfirm] = useState(false);
   const [estimatedReach, setEstimatedReach] = useState<number>(0);
   const [loadingReach, setLoadingReach] = useState(true);
+  // Available credits for this template's category. `null` = not yet
+  // loaded (or category unrecognized) — we don't gate the UI until we
+  // have a real number. The hard block is authoritative server/hook-side
+  // (§2); this is purely to surface the limit before the user clicks.
+  const [balance, setBalance] = useState<number | null>(null);
 
   useEffect(() => {
     async function calculateReach() {
@@ -82,6 +90,34 @@ export function Step4ScheduleSend({
 
     calculateReach();
   }, [audience]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadBalance() {
+      const category = template.category;
+      if (!accountId || !isCreditCategory(category)) {
+        setBalance(null);
+        return;
+      }
+      try {
+        const value = await fetchCategoryBalance(
+          createClient(),
+          accountId,
+          category,
+        );
+        if (!cancelled) setBalance(value);
+      } catch {
+        if (!cancelled) setBalance(null);
+      }
+    }
+    loadBalance();
+    return () => {
+      cancelled = true;
+    };
+  }, [accountId, template.category]);
+
+  const insufficientCredits =
+    balance !== null && !loadingReach && estimatedReach > balance;
 
   const audienceLabel =
     audience.type === 'all'
@@ -141,7 +177,32 @@ export function Step4ScheduleSend({
             <p className="text-xs text-muted-foreground">Language</p>
             <p className="text-foreground">{template.language ?? 'en_US'}</p>
           </div>
+          {balance !== null && (
+            <div>
+              <p className="text-xs text-muted-foreground">
+                {t('scheduleSend.creditsAvailable', { category: template.category })}
+              </p>
+              <p
+                className={
+                  insufficientCredits
+                    ? 'font-medium text-rose-400'
+                    : 'font-medium text-foreground'
+                }
+              >
+                {balance.toLocaleString()}
+              </p>
+            </div>
+          )}
         </div>
+        {insufficientCredits && (
+          <p className="text-xs font-medium text-rose-400">
+            {t('scheduleSend.insufficientCredits', {
+              category: template.category,
+              reach: estimatedReach.toLocaleString(),
+              balance: (balance ?? 0).toLocaleString(),
+            })}
+          </p>
+        )}
       </div>
 
       {/* Processing overlay */}
@@ -191,7 +252,7 @@ export function Step4ScheduleSend({
           <DialogTrigger
             render={
               <Button
-                disabled={!name.trim() || isProcessing}
+                disabled={!name.trim() || isProcessing || insufficientCredits}
                 className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               />
             }
