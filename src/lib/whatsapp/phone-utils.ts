@@ -102,3 +102,17 @@ export function phoneVariants(sanitized: string): string[] {
 export function isRecipientNotAllowedError(message: string): boolean {
   return /131030|not in allowed list|not in the allowed list/i.test(message)
 }
+
+/**
+ * Returns true when the Meta API error indicates a rate limit, so the
+ * caller can back off and replay the same send. A rate limit is
+ * rejected BEFORE the message is dispatched, so a replay can't
+ * double-message — unlike a 500/timeout, which may already have sent.
+ *
+ * Meta surfaces these as message codes (#130429 "rate limit hit",
+ * #131056 "pair rate limit", #80007 "rate limit issues"); a bare HTTP
+ * 429 with no JSON body arrives as "Meta API error: 429".
+ */
+export function isRateLimitError(message: string): boolean {
+  return /\b429\b|130429|131056|\b80007\b|rate limit/i.test(message)
+}

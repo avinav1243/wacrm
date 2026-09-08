@@ -25,10 +25,13 @@ import {
   isValidE164,
   phoneVariants,
   isRecipientNotAllowedError,
+  isRateLimitError,
 } from '@/lib/whatsapp/phone-utils';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import type { MessageTemplate } from '@/types';
 import { findOrCreateContact } from '@/lib/api/v1/contacts';
+import { BATCH_SEND_ATTEMPTS, batchRetryDelayMs } from '@/lib/broadcast-retry';
+import { MAX_BROADCAST_RECIPIENTS } from '@/lib/broadcast-limits';
 
 /** Thrown by createBroadcast on a caller-visible failure; route maps it. */
 export class BroadcastError extends Error {
@@ -74,7 +77,19 @@ export interface BroadcastPlan {
   rejected: number;
 }
 
-const MAX_RECIPIENTS = 1000;
+/**
+ * Per-request recipient cap, shared with the wizard + resume paths via
+ * broadcast-limits. Matches the account's Meta 24-hour messaging tier.
+ */
+const MAX_RECIPIENTS = MAX_BROADCAST_RECIPIENTS;
+
+/** Server-side send pacing (ported from the old browser fan-out). */
+const SEND_BATCH_SIZE = 10;
+const SEND_BATCH_DELAY_MS = 1000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Validate + persist a broadcast, resolving each recipient to a
@@ -103,7 +118,7 @@ export async function createBroadcast(
   if (recipients.length > MAX_RECIPIENTS) {
     throw new BroadcastError(
       'bad_request',
-      `A broadcast is capped at ${MAX_RECIPIENTS} recipients per request; split larger sends`,
+      `A broadcast is capped at ${MAX_RECIPIENTS.toLocaleString()} recipients per request; split larger sends`,
       400
     );
   }
@@ -242,11 +257,71 @@ export async function createBroadcast(
   };
 }
 
+type VariantSendOutcome =
+  | { ok: true; messageId: string }
+  | { ok: false; error: string };
+
+/**
+ * Send one phone variant, replaying ONLY on a Meta rate-limit error
+ * (429 / #130429 / #131056). A rate limit means Meta rejected the
+ * request before sending, so a replay cannot double-message — the same
+ * contract as the browser fan-out's 429 retry (see broadcast-retry).
+ * Any other error returns immediately so the caller can record it or
+ * try the next phone variant.
+ */
+async function sendVariantWithRateLimitRetry(
+  plan: BroadcastPlan,
+  to: string,
+  params: string[]
+): Promise<VariantSendOutcome> {
+  let lastError = 'Unknown error';
+  for (let attempt = 1; attempt <= BATCH_SEND_ATTEMPTS; attempt++) {
+    try {
+      const result = await sendTemplateMessage({
+        phoneNumberId: plan.phoneNumberId,
+        accessToken: plan.accessToken,
+        to,
+        templateName: plan.templateName,
+        language: plan.templateLanguage,
+        template: plan.templateRow ?? undefined,
+        params,
+      });
+      return { ok: true, messageId: result.messageId };
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : 'Unknown error';
+      if (!isRateLimitError(lastError)) break;
+      // sendTemplateMessage discards the HTTP status, so there's no
+      // Retry-After to read; batchRetryDelayMs(429, null) yields the
+      // module's default back-off.
+      const delay =
+        attempt < BATCH_SEND_ATTEMPTS ? batchRetryDelayMs(429, null) : null;
+      if (delay === null) break;
+      await sleep(delay);
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+export interface DeliverBroadcastOptions {
+  /** Recipients sent between pacing pauses. Defaults to SEND_BATCH_SIZE. */
+  batchSize?: number;
+  /**
+   * Pause (ms) after each batch, to stay under Meta's per-number rate.
+   * Defaults to SEND_BATCH_DELAY_MS; pass 0 in tests to skip waiting.
+   */
+  batchDelayMs?: number;
+}
+
 /**
  * Fan out a {@link BroadcastPlan}: send each recipient's template
- * (phone-variant retry) and stamp its `broadcast_recipients` row.
- * Best-effort per recipient — one failure never aborts the rest.
- * Designed to run inside `after()`.
+ * (phone-variant retry + rate-limit back-off) and stamp its
+ * `broadcast_recipients` row. Best-effort per recipient — one failure
+ * never aborts the rest. Designed to run inside `after()`.
+ *
+ * Paces itself (batchSize sends, then batchDelayMs) so a full-cap send
+ * driven server-side stays under Meta's per-number messaging rate. This
+ * pacing used to live in the browser hook; it moved here when the wizard
+ * started handing delivery straight to this function.
  *
  * The per-status count columns on `broadcasts` are owned by the DB
  * aggregate trigger (migrations 003/005): each recipient-row update
@@ -257,33 +332,33 @@ export async function createBroadcast(
  */
 export async function deliverBroadcast(
   db: SupabaseClient,
-  plan: BroadcastPlan
+  plan: BroadcastPlan,
+  options: DeliverBroadcastOptions = {}
 ): Promise<void> {
-  for (const recipient of plan.planned) {
+  const batchSize = options.batchSize ?? SEND_BATCH_SIZE;
+  const batchDelayMs = options.batchDelayMs ?? SEND_BATCH_DELAY_MS;
+
+  for (let i = 0; i < plan.planned.length; i++) {
+    const recipient = plan.planned[i];
     const variants = phoneVariants(recipient.phone);
     let sentMessageId: string | null = null;
     let lastError: string | null = null;
 
     for (const variant of variants) {
-      try {
-        const result = await sendTemplateMessage({
-          phoneNumberId: plan.phoneNumberId,
-          accessToken: plan.accessToken,
-          to: variant,
-          templateName: plan.templateName,
-          language: plan.templateLanguage,
-          template: plan.templateRow ?? undefined,
-          params: recipient.params,
-        });
-        sentMessageId = result.messageId;
+      const outcome = await sendVariantWithRateLimitRetry(
+        plan,
+        variant,
+        recipient.params
+      );
+      if (outcome.ok) {
+        sentMessageId = outcome.messageId;
         lastError = null;
         break;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'Unknown error';
-        lastError = message;
-        // Only a "recipient not allowed" error is worth another variant.
-        if (!isRecipientNotAllowedError(message)) break;
       }
+      lastError = outcome.error;
+      // Only a "recipient not allowed" error is worth another variant; a
+      // rate-limit (already retried) or any other error is not.
+      if (!isRecipientNotAllowedError(outcome.error)) break;
     }
 
     if (sentMessageId) {
@@ -304,6 +379,15 @@ export async function deliverBroadcast(
           error_message: lastError || 'Unknown error',
         })
         .eq('id', recipient.recipientRowId);
+    }
+
+    // Pace after each full batch (never after the last recipient).
+    if (
+      batchDelayMs > 0 &&
+      (i + 1) % batchSize === 0 &&
+      i + 1 < plan.planned.length
+    ) {
+      await sleep(batchDelayMs);
     }
   }
 

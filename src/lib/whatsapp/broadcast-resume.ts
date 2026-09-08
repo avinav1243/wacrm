@@ -19,6 +19,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { BroadcastError, type BroadcastPlan } from '@/lib/whatsapp/broadcast-core';
+import { MAX_BROADCAST_RECIPIENTS } from '@/lib/broadcast-limits';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
@@ -33,14 +34,14 @@ export const RESUME_SCOPES: readonly ResumeScope[] = [
 ];
 
 /**
- * Recipients delivered per resume request. One pass runs inside
- * `after()`, so it is bounded by the host's function timeout — the cap
- * keeps a 5 000-recipient backlog from being one un-completable unit
- * of work. Whatever is left stays 'pending' and the caller is told how
- * many, so the UI can offer Resume again. Matches the public API's
- * per-request recipient cap.
+ * Recipients delivered per resume request — the shared broadcast cap
+ * (broadcast-limits). One pass runs inside `after()`; on self-hosted
+ * Node it runs to completion (no serverless timeout), so a full-cap
+ * send drains in a single pass. Anything left over (only possible if
+ * rows were added out-of-band) stays 'pending' and the caller is told
+ * how many, so the UI can offer Resume again.
  */
-export const RESUME_MAX_PER_REQUEST = 1000;
+export const RESUME_MAX_PER_REQUEST = MAX_BROADCAST_RECIPIENTS;
 
 /**
  * How long a `delivery_locked_at` stamp is honoured before it is read

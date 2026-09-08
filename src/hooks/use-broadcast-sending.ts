@@ -3,10 +3,11 @@
 import { useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
+import { fetchAllRows, selectInChunks } from '@/lib/supabase/fetch-all';
 import {
-  BATCH_SEND_ATTEMPTS,
-  batchRetryDelayMs,
-} from '@/lib/broadcast-retry';
+  MAX_BROADCAST_RECIPIENTS,
+  broadcastCapExceededMessage,
+} from '@/lib/broadcast-limits';
 import { normalizeKey } from '@/lib/contacts/dedupe';
 import { Contact, MessageTemplate } from '@/types';
 
@@ -45,10 +46,11 @@ interface BroadcastPayload {
   audience: AudienceConfig;
   variables: Record<string, VariableMapping>;
   /**
-   * Media URL for an IMAGE/VIDEO/DOCUMENT header. Required at send
-   * time for media-header templates — Meta rejects the send without
-   * it. Passed through as `messageParams.headerMediaUrl`; the builder
-   * falls back to the template's stored URL only when this is empty.
+   * Media URL for an IMAGE/VIDEO/DOCUMENT header, collected in the
+   * personalize step. Delivery now runs server-side, where the send
+   * builder uses the template's stored media URL; the personalize step
+   * pre-fills this field from that same stored URL. Kept for backward
+   * compatibility with callers, but no longer threaded per-send.
    */
   headerMediaUrl?: string;
 }
@@ -60,31 +62,13 @@ interface UseBroadcastSendingReturn {
 }
 
 /**
- * Meta rate-limit buffer. 10 per batch + 1 s pause matches the spec
- * and keeps us comfortably under Meta's per-phone-number messaging
- * rate so a large broadcast never trips the upstream limiter.
- *
- * Note this shape when touching `RATE_LIMITS.broadcast`: a campaign is
- * many calls to `/api/whatsapp/broadcast`, not one. A 1 000-recipient
- * send is ~100 calls over several minutes, and a bucket sized for
- * "one call per campaign" throttles most of it away (issue #472).
+ * `broadcast_recipients` inserts are chunked so each PostgREST request
+ * stays small. The send itself is no longer driven from the browser:
+ * once the rows are persisted 'pending', delivery is handed to the
+ * server (see createAndSendBroadcast step 4), so the per-message pacing
+ * that used to live here now lives in `deliverBroadcast`.
  */
-const SEND_BATCH_SIZE = 10;
-const SEND_BATCH_DELAY_MS = 1000;
-
-/** `broadcast_recipients` inserts are independent of the send rate. */
 const INSERT_BATCH_SIZE = 200;
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-interface BroadcastApiResult {
-  phone: string;
-  status: 'sent' | 'failed';
-  whatsapp_message_id?: string;
-  error?: string;
-}
 
 /** contactId → (customFieldId → value). */
 type CustomValueIndex = Map<string, Map<string, string>>;
@@ -138,15 +122,26 @@ async function fetchCustomValueIndex(
   const index: CustomValueIndex = new Map();
   if (contactIds.length === 0) return index;
 
-  // Supabase PostgREST caps the .in(...) IN-clause roughly at 1000
-  // values. Page through to stay safe.
-  const PAGE = 500;
-  for (let i = 0; i < contactIds.length; i += PAGE) {
-    const slice = contactIds.slice(i, i + PAGE);
-    const { data } = await supabase
-      .from('contact_custom_values')
-      .select('contact_id, custom_field_id, value')
-      .in('contact_id', slice);
+  // Chunk the contact_id list (URL-length safe) AND page each chunk: a
+  // chunk of 500 contacts with several custom fields each can exceed
+  // PostgREST's 1,000-row cap, which would silently drop values and
+  // produce a wrong/empty {{N}} for some recipients.
+  const CHUNK = 500;
+  for (let i = 0; i < contactIds.length; i += CHUNK) {
+    const slice = contactIds.slice(i, i + CHUNK);
+    const { data, error } = await fetchAllRows<{
+      contact_id: string;
+      custom_field_id: string;
+      value: string | null;
+    }>((from, to) =>
+      supabase
+        .from('contact_custom_values')
+        .select('contact_id, custom_field_id, value')
+        .in('contact_id', slice)
+        .range(from, to),
+    );
+    if (error)
+      throw new Error(`Failed to fetch custom values: ${error.message}`);
 
     for (const row of data ?? []) {
       const bucket = index.get(row.contact_id) ?? new Map<string, string>();
@@ -168,7 +163,11 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     let contacts: Contact[] = [];
 
     if (audience.type === 'all') {
-      const { data, error } = await supabase.from('contacts').select('*');
+      // Page past PostgREST's 1,000-row cap — an unbounded select here
+      // is exactly what truncated a 1,978-contact broadcast to 1,000.
+      const { data, error } = await fetchAllRows<Contact>((from, to) =>
+        supabase.from('contacts').select('*').range(from, to),
+      );
       if (error) throw new Error(`Failed to fetch contacts: ${error.message}`);
       contacts = data ?? [];
     } else if (
@@ -176,10 +175,17 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       audience.tagIds &&
       audience.tagIds.length > 0
     ) {
-      const { data: contactTags, error: tagError } = await supabase
-        .from('contact_tags')
-        .select('contact_id')
-        .in('tag_id', audience.tagIds);
+      // A tag can map to more than 1,000 contacts, so page the join
+      // rows; the tagIds list itself is small enough for a single .in().
+      const { data: contactTags, error: tagError } = await fetchAllRows<{
+        contact_id: string;
+      }>((from, to) =>
+        supabase
+          .from('contact_tags')
+          .select('contact_id')
+          .in('tag_id', audience.tagIds!)
+          .range(from, to),
+      );
 
       if (tagError)
         throw new Error(`Failed to fetch contact tags: ${tagError.message}`);
@@ -188,10 +194,11 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         const uniqueContactIds = [
           ...new Set(contactTags.map((ct) => ct.contact_id)),
         ];
-        const { data, error } = await supabase
-          .from('contacts')
-          .select('*')
-          .in('id', uniqueContactIds);
+        // id is unique, so chunk the (possibly >1,000) id list.
+        const { data, error } = await selectInChunks<Contact>(
+          (chunk) => supabase.from('contacts').select('*').in('id', chunk),
+          uniqueContactIds,
+        );
         if (error) throw new Error(`Failed to fetch contacts: ${error.message}`);
         contacts = data ?? [];
       }
@@ -204,10 +211,17 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     // Apply exclude tags (works across all contact-derived audience
     // types). CSV contacts are synthetic so exclusion doesn't apply.
     if (audience.excludeTagIds && audience.excludeTagIds.length > 0) {
-      const { data: excludeRows } = await supabase
-        .from('contact_tags')
-        .select('contact_id')
-        .in('tag_id', audience.excludeTagIds);
+      const { data: excludeRows, error: excludeError } = await fetchAllRows<{
+        contact_id: string;
+      }>((from, to) =>
+        supabase
+          .from('contact_tags')
+          .select('contact_id')
+          .in('tag_id', audience.excludeTagIds!)
+          .range(from, to),
+      );
+      if (excludeError)
+        throw new Error(`Failed to fetch exclude tags: ${excludeError.message}`);
       const excludedIds = new Set((excludeRows ?? []).map((r) => r.contact_id));
       contacts = contacts.filter((c) => !excludedIds.has(c.id));
     }
@@ -262,11 +276,17 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
     // Scoping to `user_id` missed rows a teammate created on a shared
     // account, so those numbers looked new and their inserts collided
     // with the account-wide unique index.
-    const { data: existing, error: lookupErr } = await supabase
-      .from('contacts')
-      .select('*')
-      .eq('account_id', accountId)
-      .in('phone_normalized', keys);
+    // phone_normalized is unique per account, so each chunk of ≤500 keys
+    // returns ≤500 rows — safe to chunk and concatenate.
+    const { data: existing, error: lookupErr } = await selectInChunks<Contact>(
+      (chunk) =>
+        supabase
+          .from('contacts')
+          .select('*')
+          .eq('account_id', accountId)
+          .in('phone_normalized', chunk),
+      keys,
+    );
     if (lookupErr) {
       throw new Error(`Failed to look up CSV contacts: ${lookupErr.message}`);
     }
@@ -317,29 +337,33 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
   ): Promise<Contact[]> {
     const { fieldId, operator, value } = filter;
 
-    // Build the WHERE clause for the operator. PostgREST supports
-    // eq/neq/ilike via the query builder — use ilike with wildcards
-    // for "contains" so the match is case-insensitive.
-    let query = supabase
-      .from('contact_custom_values')
-      .select('contact_id')
-      .eq('custom_field_id', fieldId);
-
-    if (operator === 'is') query = query.eq('value', value);
-    else if (operator === 'is_not') query = query.neq('value', value);
-    else if (operator === 'contains') query = query.ilike('value', `%${value}%`);
-
-    const { data: matches, error: matchErr } = await query;
+    // Match rows for this custom field under the chosen operator. The
+    // match set can exceed 1,000, so page it — rebuilding the filtered
+    // query each page (PostgREST supports eq/neq/ilike via the builder;
+    // ilike with wildcards gives a case-insensitive "contains").
+    const { data: matches, error: matchErr } = await fetchAllRows<{
+      contact_id: string;
+    }>((from, to) => {
+      let query = supabase
+        .from('contact_custom_values')
+        .select('contact_id')
+        .eq('custom_field_id', fieldId);
+      if (operator === 'is') query = query.eq('value', value);
+      else if (operator === 'is_not') query = query.neq('value', value);
+      else if (operator === 'contains')
+        query = query.ilike('value', `%${value}%`);
+      return query.range(from, to);
+    });
     if (matchErr)
       throw new Error(`Custom-field filter failed: ${matchErr.message}`);
 
     const contactIds = [...new Set((matches ?? []).map((m) => m.contact_id))];
     if (contactIds.length === 0) return [];
 
-    const { data, error } = await supabase
-      .from('contacts')
-      .select('*')
-      .in('id', contactIds);
+    const { data, error } = await selectInChunks<Contact>(
+      (chunk) => supabase.from('contacts').select('*').in('id', chunk),
+      contactIds,
+    );
     if (error) throw new Error(`Failed to fetch contacts: ${error.message}`);
     return data ?? [];
   }
@@ -375,8 +399,36 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error('No contacts found for this audience.');
       }
 
+      // Hard cap — never truncate. Silently sending to only the first N
+      // (PostgREST's old 1,000-row cut-off) is the exact bug we're
+      // fixing; refuse loudly so the user narrows or splits the send.
+      if (contacts.length > MAX_BROADCAST_RECIPIENTS) {
+        throw new Error(broadcastCapExceededMessage(contacts.length));
+      }
+
+      // ── Step 1.5: Resolve per-recipient params ────────────────────
+      // Done BEFORE the broadcast row exists so a custom-values failure
+      // can't leave an orphaned 'sending' broadcast with no recipients.
+      // These frozen params are also what makes the send resumable: the
+      // server delivery loop reads them straight off the recipient rows.
+      setProgress(15);
+      const customValueIndex = await fetchCustomValueIndex(
+        supabase,
+        contacts.map((c) => c.id),
+      );
+      const paramsByContact = new Map(
+        contacts.map((contact) => [
+          contact.id,
+          resolveVariables(
+            payload.variables,
+            contact,
+            customValueIndex.get(contact.id),
+          ),
+        ]),
+      );
+
       // ── Step 2: Create broadcast row ──────────────────────────────
-      setProgress(10);
+      setProgress(20);
       const { data: broadcast, error: broadcastError } = await supabase
         .from('broadcasts')
         .insert({
@@ -409,29 +461,9 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         );
       }
 
-      // ── Step 3: Insert recipient rows ─────────────────────────────
-      // Custom values are fetched BEFORE the insert so each row can
-      // carry its resolved template params. Those params are what makes
-      // the campaign resumable server-side (issue #472): the send loop
-      // below runs in this browser tab, and if the tab goes away the
-      // only record of what {{1}} should be for each contact is this
-      // column. Resolving once here also means the resume sends exactly
-      // what this pass would have.
-      setProgress(20);
-      const customValueIndex = await fetchCustomValueIndex(
-        supabase,
-        contacts.map((c) => c.id),
-      );
-      const paramsByContact = new Map(
-        contacts.map((contact) => [
-          contact.id,
-          resolveVariables(
-            payload.variables,
-            contact,
-            customValueIndex.get(contact.id),
-          ),
-        ]),
-      );
+      // ── Step 3: Insert recipient rows (all 'pending') ─────────────
+      // Each row carries its frozen template_params, so the server-side
+      // delivery loop sends exactly what this pass resolved.
       const recipientRows = contacts.map((contact) => ({
         broadcast_id: broadcast.id,
         contact_id: contact.id,
@@ -449,7 +481,7 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
           // with an incomplete recipient set, so webhook status updates
           // couldn't find some rows and the aggregate counts drifted.
           // Flip the broadcast to failed so the user sees the problem
-          // immediately, then throw to abort the send loop.
+          // immediately, then throw to abort.
           await supabase
             .from('broadcasts')
             .update({
@@ -461,152 +493,39 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
             `Failed to insert recipient batch ${i / INSERT_BATCH_SIZE + 1}: ${recipientError.message}`,
           );
         }
+        // Rows persisted: advance 20 → 85 across the insert.
+        setProgress(
+          20 + Math.round(((i + batch.length) / recipientRows.length) * 65),
+        );
       }
 
-      // ── Step 4: Fetch recipients back (joined contact) ────────────
-      setProgress(30);
-      const { data: recipients, error: recipientsFetchError } = await supabase
-        .from('broadcast_recipients')
-        .select('*, contact:contacts(*)')
-        .eq('broadcast_id', broadcast.id);
-
-      if (recipientsFetchError || !recipients) {
-        throw new Error('Failed to fetch broadcast recipients');
+      // ── Step 4: Hand delivery to the server ───────────────────────
+      // Every recipient row is now persisted 'pending' with frozen
+      // params. POST to the resume endpoint: it claims the per-broadcast
+      // delivery lock and fans out to Meta inside after() — server-side —
+      // so the user can close this tab and the send keeps running. This
+      // is the same machinery that recovers an abandoned send, so a
+      // mid-send server restart is finished by clicking Resume.
+      //
+      // Media-header templates use the template's stored media URL on the
+      // server (the personalize step pre-fills that same URL), so no
+      // per-send media override is threaded here.
+      setProgress(90);
+      const resumeRes = await fetch(
+        `/api/whatsapp/broadcast/${broadcast.id}/resume`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scope: 'pending' }),
+        },
+      );
+      if (!resumeRes.ok) {
+        const body = await resumeRes.json().catch(() => ({}));
+        throw new Error(
+          body.error ||
+            'Broadcast was created but delivery could not start. Open it and click Resume.',
+        );
       }
-
-      let failedCount = 0;
-      const totalRecipients = recipients.length;
-
-      // Media-header templates (image/video/document) require a media
-      // URL on every send. Collected in the personalize step and applied
-      // to all recipients; falls back to the template's stored URL on the
-      // server when omitted.
-      const headerType = payload.template.header_type;
-      const isMediaHeader =
-        headerType === 'image' ||
-        headerType === 'video' ||
-        headerType === 'document';
-      const headerMediaUrl = payload.headerMediaUrl?.trim();
-      const messageParams =
-        isMediaHeader && headerMediaUrl ? { headerMediaUrl } : undefined;
-
-      for (let i = 0; i < recipients.length; i += SEND_BATCH_SIZE) {
-        const batch = recipients.slice(i, i + SEND_BATCH_SIZE);
-
-        const apiRecipients = batch
-          .filter((r) => r.contact?.phone)
-          .map((r) => ({
-            phone: r.contact!.phone as string,
-            // Read back off the row rather than re-resolved, so this
-            // pass and any later resume send identical params.
-            params: Array.isArray(r.template_params) ? r.template_params : [],
-            ...(messageParams ? { messageParams } : {}),
-          }));
-
-        if (apiRecipients.length === 0) continue;
-
-        try {
-          // Send the batch, waiting out a 429 rather than writing the
-          // whole batch off as failed. Only 429 is replayed — see
-          // batchRetryDelayMs for why nothing else can be.
-          let data: { error?: string; results?: BroadcastApiResult[] } = {};
-          for (let attempt = 1; ; attempt++) {
-            const res = await fetch('/api/whatsapp/broadcast', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                recipients: apiRecipients,
-                template_name: payload.template.name,
-                template_language: payload.template.language ?? 'en_US',
-              }),
-            });
-
-            data = await res.json();
-            if (res.ok) break;
-
-            const retryIn =
-              attempt < BATCH_SEND_ATTEMPTS
-                ? batchRetryDelayMs(res.status, res.headers.get('Retry-After'))
-                : null;
-            if (retryIn === null) {
-              throw new Error(data.error || 'Broadcast API request failed');
-            }
-            await sleep(retryIn);
-          }
-
-          const resultsByPhone = new Map<string, BroadcastApiResult>();
-          for (const r of (data.results ?? []) as BroadcastApiResult[]) {
-            resultsByPhone.set(r.phone, r);
-          }
-
-          for (const recipient of batch) {
-            const phone = recipient.contact?.phone;
-            const result = phone ? resultsByPhone.get(phone) : undefined;
-
-            if (!result) {
-              failedCount++;
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'failed',
-                  error_message: 'No phone number on contact',
-                })
-                .eq('id', recipient.id);
-              continue;
-            }
-
-            if (result.status === 'sent') {
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'sent',
-                  sent_at: new Date().toISOString(),
-                  whatsapp_message_id: result.whatsapp_message_id ?? null,
-                  error_message: null,
-                })
-                .eq('id', recipient.id);
-            } else {
-              failedCount++;
-              await supabase
-                .from('broadcast_recipients')
-                .update({
-                  status: 'failed',
-                  error_message: result.error ?? 'Unknown error',
-                })
-                .eq('id', recipient.id);
-            }
-          }
-        } catch (err) {
-          for (const recipient of batch) {
-            failedCount++;
-            await supabase
-              .from('broadcast_recipients')
-              .update({
-                status: 'failed',
-                error_message: err instanceof Error ? err.message : 'Unknown error',
-              })
-              .eq('id', recipient.id);
-          }
-        }
-
-        const progressPct =
-          30 + Math.round(((i + batch.length) / totalRecipients) * 60);
-        setProgress(progressPct);
-
-        if (i + SEND_BATCH_SIZE < recipients.length) {
-          await sleep(SEND_BATCH_DELAY_MS);
-        }
-      }
-
-      // ── Step 5: Finalize status ───────────────────────────────────
-      // Aggregate counts are maintained by the DB trigger (migration
-      // 003); we only flip the final status here.
-      setProgress(95);
-      const finalStatus = failedCount === totalRecipients ? 'failed' : 'sent';
-      await supabase
-        .from('broadcasts')
-        .update({ status: finalStatus })
-        .eq('id', broadcast.id);
 
       setProgress(100);
       return broadcast.id;

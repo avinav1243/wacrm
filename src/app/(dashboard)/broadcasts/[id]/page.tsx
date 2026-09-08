@@ -1,8 +1,9 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { Broadcast, BroadcastRecipient, RecipientStatus } from '@/types';
 import { Button } from '@/components/ui/button';
 import {
@@ -124,6 +125,17 @@ const RECIPIENT_STATUSES: readonly RecipientStatus[] = [
 ];
 
 /**
+ * Poll cadence while this broadcast is sending. The send now runs
+ * server-side (issue #472 machinery), so the user can close the tab; if
+ * they keep it open, this surfaces the climbing counts. Mirrors the list
+ * page's poll. Only the (cheap) broadcasts row is polled each tick — the
+ * per-status counts live there (trigger-owned, migrations 003/005) and
+ * drive the stat cards, funnel and status badge. The (potentially large)
+ * recipients list is re-read only when the send settles, not every tick.
+ */
+const POLL_INTERVAL_MS = 5_000;
+
+/**
  * CSV export helper — RFC 4180 quoting. Quote every field so
  * commas/newlines/quotes round-trip cleanly.
  */
@@ -164,37 +176,105 @@ export default function BroadcastDetailPage() {
     'pending' | 'failed' | null
   >(null);
 
+  // Drives polling only while the broadcast is actively sending.
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Just the broadcasts row — cheap, polled each tick for live counts.
+  const fetchBroadcastRow = useCallback(async (): Promise<Broadcast> => {
+    const supabase = createClient();
+    const { data: bc, error: bcError } = await supabase
+      .from('broadcasts')
+      .select('*')
+      .eq('id', broadcastId)
+      .single();
+    if (bcError) throw bcError;
+    setBroadcast(bc);
+    return bc;
+  }, [broadcastId]);
+
+  // Every recipient row, paged past PostgREST's 1,000-row cap. Without
+  // this, viewing or exporting any broadcast over 1,000 recipients (the
+  // recovery export among them) silently stops at 1,000.
+  const fetchRecipients = useCallback(async () => {
+    const supabase = createClient();
+    const { data: recs, error: recsError } =
+      await fetchAllRows<BroadcastRecipient>((from, to) =>
+        supabase
+          .from('broadcast_recipients')
+          .select('*, contact:contacts(*)')
+          .eq('broadcast_id', broadcastId)
+          .order('created_at', { ascending: false })
+          .range(from, to),
+      );
+    if (recsError) throw new Error(recsError.message);
+    setRecipients(recs ?? []);
+  }, [broadcastId]);
+
   const fetchData = useCallback(async () => {
     try {
-      const supabase = createClient();
-
-      const { data: bc, error: bcError } = await supabase
-        .from('broadcasts')
-        .select('*')
-        .eq('id', broadcastId)
-        .single();
-
-      if (bcError) throw bcError;
-      setBroadcast(bc);
-
-      const { data: recs, error: recsError } = await supabase
-        .from('broadcast_recipients')
-        .select('*, contact:contacts(*)')
-        .eq('broadcast_id', broadcastId)
-        .order('created_at', { ascending: false });
-
-      if (recsError) throw recsError;
-      setRecipients(recs ?? []);
+      await Promise.all([fetchBroadcastRow(), fetchRecipients()]);
     } catch (err) {
       setError(err instanceof Error ? err.message : t('notFound'));
     } finally {
       setLoading(false);
     }
-  }, [broadcastId, t]);
+  }, [fetchBroadcastRow, fetchRecipients, t]);
 
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  const isSending = broadcast?.status === 'sending';
+
+  // Poll tick: refresh the (cheap) counts every interval; when the send
+  // settles out of 'sending', re-read the recipient rows once so the
+  // table and the Resume section match the final state. A transient poll
+  // failure is swallowed — the last good snapshot stays and we retry.
+  const pollTick = useCallback(async () => {
+    try {
+      const bc = await fetchBroadcastRow();
+      if (bc.status !== 'sending') {
+        await fetchRecipients();
+      }
+    } catch {
+      /* keep last snapshot; next tick retries */
+    }
+  }, [fetchBroadcastRow, fetchRecipients]);
+
+  useEffect(() => {
+    function startPolling() {
+      if (pollTimer.current) return;
+      pollTimer.current = setInterval(pollTick, POLL_INTERVAL_MS);
+    }
+    function stopPolling() {
+      if (!pollTimer.current) return;
+      clearInterval(pollTimer.current);
+      pollTimer.current = null;
+    }
+
+    // Pause while the tab is hidden (the send keeps running server-side);
+    // on refocus, refetch immediately so the user isn't shown stale data.
+    function handleVisibilityChange() {
+      if (!isSending) return;
+      if (document.visibilityState === 'hidden') {
+        stopPolling();
+      } else {
+        pollTick();
+        startPolling();
+      }
+    }
+
+    if (isSending && document.visibilityState === 'visible') {
+      startPolling();
+    } else {
+      stopPolling();
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      stopPolling();
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [isSending, pollTick]);
 
   const filteredRecipients = useMemo(
     () =>
@@ -335,6 +415,35 @@ export default function BroadcastDetailPage() {
 
   return (
     <div className="space-y-6">
+      {/* Top indeterminate bar while the server-side send is in flight —
+          the same signal the list page shows, so an open tab reads as
+          "still working" even between the 5s count refreshes. */}
+      {isSending && (
+        <div
+          role="progressbar"
+          aria-label="Broadcast in progress"
+          className="broadcast-indeterminate fixed inset-x-0 top-0 z-40 h-0.5 overflow-hidden bg-muted"
+        >
+          <div className="broadcast-indeterminate-bar h-0.5 bg-primary" />
+          <style jsx>{`
+            .broadcast-indeterminate-bar {
+              width: 33%;
+              transform: translateX(-100%);
+              animation: broadcast-slide 1.6s cubic-bezier(0.4, 0, 0.2, 1)
+                infinite;
+            }
+            @keyframes broadcast-slide {
+              0% {
+                transform: translateX(-100%);
+              }
+              100% {
+                transform: translateX(400%);
+              }
+            }
+          `}</style>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div className="flex items-center gap-4">
