@@ -34,6 +34,16 @@ export interface PostgrestListResult<T> {
  * fresh query each call (filters/order rebuilt inside it). Stops when a
  * page comes back shorter than `pageSize` — the last page. Propagates
  * the first error verbatim so call sites keep their existing messages.
+ *
+ * IMPORTANT: order by a DETERMINISTIC TOTAL ORDER — i.e. end the sort on
+ * a unique column (typically `id`). Offset paging issues one
+ * `OFFSET/LIMIT` query per page, so if the ORDER BY has ties, Postgres
+ * may order the tied rows differently per page: the same row then appears
+ * on two pages (duplicates) while others are skipped (gaps). This bites
+ * hardest on rows bulk-inserted in one transaction, where a `created_at
+ * DEFAULT now()` column is identical for every row and thus fully tied.
+ * A query with no `.order()` at all is only safe when the caller collapses
+ * the result into a set/dedupes by a key downstream.
  */
 export async function fetchAllRows<T>(
   buildRangeQuery: (from: number, to: number) => PromiseLike<PostgrestListResult<T>>,

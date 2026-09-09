@@ -203,7 +203,16 @@ export default function BroadcastDetailPage() {
           .from('broadcast_recipients')
           .select('*, contact:contacts(*)')
           .eq('broadcast_id', broadcastId)
+          // created_at alone is NOT a stable sort here: every recipient
+          // row is inserted in one transaction by
+          // create_broadcast_with_recipients, and NOW() is the transaction
+          // timestamp, so all rows share it. Offset pagination over a
+          // fully-tied ORDER BY returns an arbitrary slice per .range()
+          // window — the same row lands on two pages (duplicate React keys)
+          // while others are dropped from the list and the CSV export. The
+          // unique id makes it a deterministic total order.
           .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
           .range(from, to),
       );
     if (recsError) throw new Error(recsError.message);

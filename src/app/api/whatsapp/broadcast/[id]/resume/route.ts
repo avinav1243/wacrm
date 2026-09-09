@@ -28,6 +28,9 @@ import {
   markBroadcastSending,
   planBroadcastResume,
   releaseBroadcastDelivery,
+  touchBroadcastDelivery,
+  DELIVERY_HEARTBEAT_MS,
+  DELIVERY_LOCK_STALE_MS,
   RESUME_SCOPES,
   type ResumeScope,
 } from '@/lib/whatsapp/broadcast-resume';
@@ -38,8 +41,9 @@ import {
   RATE_LIMITS,
 } from '@/lib/rate-limit';
 
-// The fan-out below is sequential over up to MAX_BROADCAST_RECIPIENTS
-// (10,000) recipients inside after(), self-paced (see deliverBroadcast).
+// The fan-out below runs inside after(), over up to
+// MAX_BROADCAST_RECIPIENTS (10,000) recipients, as a small pool of
+// concurrent sends metered to a fixed rate (see deliverBroadcast).
 //
 // maxDuration is only read by serverless deployment platforms (per the
 // Next.js docs, "Deployment platforms can use maxDuration from the build
@@ -47,9 +51,9 @@ import {
 // a long-lived Node server (output:'standalone', `node server.js`), where
 // after() runs to completion in-process and nothing enforces this value —
 // so it is effectively inert here. It is kept as an honest hint: a full
-// paced 10,000-recipient send takes tens of minutes and would exceed any
-// serverless limit, so this route must run on a long-lived server, never
-// a serverless function.
+// 10,000-recipient send takes several minutes and would exceed most
+// serverless limits, so this route must run on a long-lived server,
+// never a serverless function.
 export const maxDuration = 300;
 
 export async function POST(
@@ -86,7 +90,10 @@ export async function POST(
       return NextResponse.json(
         {
           error:
-            'A delivery pass is already running for this broadcast. Wait for it to finish before resuming again.',
+            'A delivery pass is already running for this broadcast. Wait for it to finish before resuming again. ' +
+            `If the server restarted mid-send, the lock clears itself within ${Math.round(
+              DELIVERY_LOCK_STALE_MS / 60000
+            )} minutes — try again then.`,
         },
         { status: 409 }
       );
@@ -109,7 +116,15 @@ export async function POST(
     const admin = supabaseAdmin();
     after(async () => {
       try {
-        await deliverBroadcast(admin, plan);
+        await deliverBroadcast(admin, plan, {
+          // Keep re-stamping the lock we claimed above. Without this the
+          // lock's age measures when the pass STARTED, so a window short
+          // enough to recover a crashed pass would also let a second
+          // Resume steal this one mid-flight and message everyone still
+          // pending a second time.
+          onHeartbeat: () => touchBroadcastDelivery(admin, id),
+          heartbeatIntervalMs: DELIVERY_HEARTBEAT_MS,
+        });
       } catch (err) {
         console.error(
           '[broadcast-resume] delivery threw:',

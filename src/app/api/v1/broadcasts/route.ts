@@ -26,14 +26,17 @@ import { after } from 'next/server';
 
 import { requireApiKey } from '@/lib/auth/api-context';
 
-// The `after()` fan-out below sends to every recipient sequentially and
-// runs within this route's max duration (the same constraint the
-// webhook route documents). Give it headroom beyond the platform
-// default so a modest batch isn't cut off mid-send — which would leave
-// recipient rows 'pending' and the broadcast stuck 'sending'. This is a
-// bound, not a guarantee: a near-cap (MAX_RECIPIENTS) audience can
-// still exceed 60s, so very large sends should be split across
-// requests. A durable queue/cron drain is the complete fix (follow-up).
+// The `after()` fan-out below sends to every recipient as a small pool
+// of concurrent, rate-metered sends (see deliverBroadcast) and runs
+// within this route's max duration — the same constraint the webhook
+// route documents. Give it headroom beyond the platform default so a
+// modest batch isn't cut off mid-send, which would leave recipient rows
+// 'pending' and the broadcast stuck 'sending'. This is a bound, not a
+// guarantee: a near-cap (MAX_RECIPIENTS) audience still takes minutes,
+// so on a serverless platform very large sends should be split across
+// requests. On the self-hosted Node target this value is inert and
+// after() runs to completion. A durable queue/cron drain is the
+// complete fix (follow-up).
 export const maxDuration = 60;
 import { ok, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
 import { resolveAuditUserId, ContactError } from '@/lib/api/v1/contacts';

@@ -12,6 +12,47 @@
 const META_API_VERSION = 'v21.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
 
+/**
+ * Hard ceiling on how long a single outbound Meta request may take.
+ *
+ * Node's `fetch` has no default response timeout, so a hung connection
+ * blocks its `await` forever. In the broadcast fan-out that froze whole
+ * campaigns: one stalled socket stopped every remaining recipient, the
+ * sent count never moved again, the broadcast stayed 'sending', and the
+ * delivery lock was never released (the release runs in a `finally`,
+ * which a promise that never settles never reaches). A timeout turns
+ * that into an ordinary per-recipient failure the operator can retry.
+ */
+export const META_REQUEST_TIMEOUT_MS = 30_000
+
+/**
+ * `fetch` with {@link META_REQUEST_TIMEOUT_MS} applied.
+ *
+ * The abort surfaces as a DOMException whose message ("The operation was
+ * aborted due to timeout" / "signal timed out") names neither Meta nor
+ * the timeout we chose, and these messages get persisted verbatim into
+ * `broadcast_recipients.error_message` — so relabel it into something
+ * that reads sensibly in that column.
+ */
+async function metaFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: AbortSignal.timeout(META_REQUEST_TIMEOUT_MS),
+    })
+  } catch (err) {
+    if (
+      err instanceof Error &&
+      (err.name === 'TimeoutError' || err.name === 'AbortError')
+    ) {
+      throw new Error(
+        `Meta API request timed out after ${META_REQUEST_TIMEOUT_MS}ms`
+      )
+    }
+    throw err
+  }
+}
+
 export interface MetaSendResult {
   messageId: string
 }
@@ -244,7 +285,7 @@ export async function sendTextMessage(
   if (contextMessageId) {
     body.context = { message_id: contextMessageId }
   }
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -310,7 +351,7 @@ export async function sendMediaMessage(
   }
   if (contextMessageId) body.context = { message_id: contextMessageId }
 
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -428,7 +469,7 @@ export async function sendTemplateMessage(
     body.context = { message_id: contextMessageId }
   }
 
-  const response = await fetch(url, {
+  const response = await metaFetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',

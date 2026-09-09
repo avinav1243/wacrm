@@ -8,8 +8,9 @@
 //                        `broadcasts` row + `broadcast_recipients`
 //                        rows (status 'pending'), return a plan.
 //   deliverBroadcast() — send each recipient's template via Meta
-//                        (phone-variant retry), stamp each recipient
-//                        row + the aggregate counts, finalize status.
+//                        (phone-variant retry) from a small pool of
+//                        rate-metered concurrent sends, stamp each
+//                        recipient row, finalize status.
 //
 // Recipient rows carry `whatsapp_message_id`, so the inbound webhook's
 // status handler (which matches on that column) updates delivered/read
@@ -83,12 +84,55 @@ export interface BroadcastPlan {
  */
 const MAX_RECIPIENTS = MAX_BROADCAST_RECIPIENTS;
 
-/** Server-side send pacing (ported from the old browser fan-out). */
-const SEND_BATCH_SIZE = 10;
-const SEND_BATCH_DELAY_MS = 1000;
+/**
+ * Server-side send pacing.
+ *
+ * Delivery used to be strictly sequential with a 1s pause every 10
+ * sends. At the 10,000-recipient cap that is ~17 minutes of pure sleep
+ * on top of 10,000 serialized Meta round-trips — over an hour per
+ * campaign, an effective ~3 messages/second, and every minute of it a
+ * window in which a restart strands the remainder.
+ *
+ * So instead: keep a few sends in flight and meter when each one
+ * *starts*. SEND_MAX_PER_SECOND stays far below Meta's Cloud API
+ * throughput (80 messages/second by default, upgradable to 500) — the
+ * goal is finishing in minutes, not running at the ceiling. Note this
+ * is unrelated to the account's 24-hour messaging limit
+ * (MAX_BROADCAST_RECIPIENTS): that counts unique recipients per day,
+ * not rate, so concurrency does not consume any more of it.
+ */
+const SEND_CONCURRENCY = 8;
+const SEND_MAX_PER_SECOND = 20;
+
+/** Default cadence for the caller's liveness callback. */
+const HEARTBEAT_INTERVAL_MS = 30_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Evenly meters the START of each send to at most `perSecond`.
+ *
+ * Reserving a slot up front, rather than sleeping after every Nth send,
+ * keeps the outgoing rate steady even when Meta's responses come back at
+ * wildly different speeds: a slow response overlaps the next send
+ * instead of stalling the queue behind it. Returns a no-op gate for a
+ * non-positive rate, which is how tests run unmetered.
+ */
+function createRateGate(perSecond: number): () => Promise<void> {
+  if (!Number.isFinite(perSecond) || perSecond <= 0) {
+    return () => Promise.resolve();
+  }
+  const minIntervalMs = 1000 / perSecond;
+  let nextSlot = 0;
+  return async () => {
+    const now = Date.now();
+    const slot = Math.max(now, nextSlot);
+    nextSlot = slot + minIntervalMs;
+    const wait = slot - now;
+    if (wait > 0) await sleep(wait);
+  };
 }
 
 /**
@@ -303,13 +347,75 @@ async function sendVariantWithRateLimitRetry(
 }
 
 export interface DeliverBroadcastOptions {
-  /** Recipients sent between pacing pauses. Defaults to SEND_BATCH_SIZE. */
-  batchSize?: number;
+  /** Sends kept in flight at once. Defaults to SEND_CONCURRENCY. */
+  concurrency?: number;
   /**
-   * Pause (ms) after each batch, to stay under Meta's per-number rate.
-   * Defaults to SEND_BATCH_DELAY_MS; pass 0 in tests to skip waiting.
+   * Ceiling on how many sends may START per second, to stay under
+   * Meta's per-number throughput. Defaults to SEND_MAX_PER_SECOND;
+   * pass 0 in tests to run unmetered.
    */
-  batchDelayMs?: number;
+  maxPerSecond?: number;
+  /**
+   * Called periodically for as long as the pass runs, so the caller can
+   * prove its delivery lock is still alive (see
+   * `touchBroadcastDelivery`). Failures are swallowed — a lost keepalive
+   * write must not abort a send in progress.
+   */
+  onHeartbeat?: () => Promise<void>;
+  /** Cadence for `onHeartbeat`. Defaults to HEARTBEAT_INTERVAL_MS. */
+  heartbeatIntervalMs?: number;
+}
+
+/**
+ * Send one recipient's template and stamp its `broadcast_recipients`
+ * row. Resolves either way: a failure is recorded on the row, never
+ * thrown, so one bad number cannot take down the rest of the pass.
+ */
+async function deliverOne(
+  db: SupabaseClient,
+  plan: BroadcastPlan,
+  recipient: PlannedRecipient
+): Promise<void> {
+  const variants = phoneVariants(recipient.phone);
+  let sentMessageId: string | null = null;
+  let lastError: string | null = null;
+
+  for (const variant of variants) {
+    const outcome = await sendVariantWithRateLimitRetry(
+      plan,
+      variant,
+      recipient.params
+    );
+    if (outcome.ok) {
+      sentMessageId = outcome.messageId;
+      lastError = null;
+      break;
+    }
+    lastError = outcome.error;
+    // Only a "recipient not allowed" error is worth another variant; a
+    // rate-limit (already retried) or any other error is not.
+    if (!isRecipientNotAllowedError(outcome.error)) break;
+  }
+
+  if (sentMessageId) {
+    await db
+      .from('broadcast_recipients')
+      .update({
+        status: 'sent',
+        sent_at: new Date().toISOString(),
+        whatsapp_message_id: sentMessageId,
+        error_message: null,
+      })
+      .eq('id', recipient.recipientRowId);
+  } else {
+    await db
+      .from('broadcast_recipients')
+      .update({
+        status: 'failed',
+        error_message: lastError || 'Unknown error',
+      })
+      .eq('id', recipient.recipientRowId);
+  }
 }
 
 /**
@@ -318,10 +424,15 @@ export interface DeliverBroadcastOptions {
  * `broadcast_recipients` row. Best-effort per recipient — one failure
  * never aborts the rest. Designed to run inside `after()`.
  *
- * Paces itself (batchSize sends, then batchDelayMs) so a full-cap send
- * driven server-side stays under Meta's per-number messaging rate. This
- * pacing used to live in the browser hook; it moved here when the wizard
- * started handing delivery straight to this function.
+ * Runs a small pool of workers over a shared cursor, with a rate gate on
+ * the start of each send (see {@link createRateGate}). The previous
+ * strictly-sequential loop meant one slow Meta call held up every
+ * remaining recipient, and one *hung* call froze the campaign outright:
+ * the sent count stopped dead, the status never finalized, and the
+ * caller's `finally` — hence its lock release — was never reached,
+ * because the promise never settled. A pool bounds the blast radius of a
+ * slow response, and `sendTemplateMessage`'s request timeout bounds it
+ * in time.
  *
  * The per-status count columns on `broadcasts` are owned by the DB
  * aggregate trigger (migrations 003/005): each recipient-row update
@@ -335,60 +446,48 @@ export async function deliverBroadcast(
   plan: BroadcastPlan,
   options: DeliverBroadcastOptions = {}
 ): Promise<void> {
-  const batchSize = options.batchSize ?? SEND_BATCH_SIZE;
-  const batchDelayMs = options.batchDelayMs ?? SEND_BATCH_DELAY_MS;
+  const concurrency = Math.max(1, options.concurrency ?? SEND_CONCURRENCY);
+  const gate = createRateGate(options.maxPerSecond ?? SEND_MAX_PER_SECOND);
 
-  for (let i = 0; i < plan.planned.length; i++) {
-    const recipient = plan.planned[i];
-    const variants = phoneVariants(recipient.phone);
-    let sentMessageId: string | null = null;
-    let lastError: string | null = null;
+  // Heartbeat on a timer rather than from inside the send loop: a pass
+  // whose workers are all parked on a slow Meta call is still very much
+  // alive, and must not have its lock judged abandoned.
+  const heartbeat = options.onHeartbeat;
+  const heartbeatTimer = heartbeat
+    ? setInterval(
+        () => void heartbeat().catch(() => {}),
+        options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS
+      )
+    : null;
+  // Never let the keepalive alone hold the Node process open.
+  heartbeatTimer?.unref?.();
 
-    for (const variant of variants) {
-      const outcome = await sendVariantWithRateLimitRetry(
-        plan,
-        variant,
-        recipient.params
-      );
-      if (outcome.ok) {
-        sentMessageId = outcome.messageId;
-        lastError = null;
-        break;
-      }
-      lastError = outcome.error;
-      // Only a "recipient not allowed" error is worth another variant; a
-      // rate-limit (already retried) or any other error is not.
-      if (!isRecipientNotAllowedError(outcome.error)) break;
-    }
-
-    if (sentMessageId) {
-      await db
-        .from('broadcast_recipients')
-        .update({
-          status: 'sent',
-          sent_at: new Date().toISOString(),
-          whatsapp_message_id: sentMessageId,
-          error_message: null,
-        })
-        .eq('id', recipient.recipientRowId);
-    } else {
-      await db
-        .from('broadcast_recipients')
-        .update({
-          status: 'failed',
-          error_message: lastError || 'Unknown error',
-        })
-        .eq('id', recipient.recipientRowId);
-    }
-
-    // Pace after each full batch (never after the last recipient).
-    if (
-      batchDelayMs > 0 &&
-      (i + 1) % batchSize === 0 &&
-      i + 1 < plan.planned.length
-    ) {
-      await sleep(batchDelayMs);
-    }
+  try {
+    // Shared cursor. `cursor++` has no await between its read and write,
+    // so each worker claims a distinct index — no recipient is sent
+    // twice, and none is skipped.
+    let cursor = 0;
+    const workerCount = Math.min(concurrency, plan.planned.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        for (;;) {
+          const i = cursor++;
+          if (i >= plan.planned.length) return;
+          await gate();
+          // deliverOne records its own failures; this guard is for the
+          // unexpected (a DB client throw), which must not kill the
+          // worker and strand every recipient it had left to send.
+          await deliverOne(db, plan, plan.planned[i]).catch((err) => {
+            console.error(
+              '[broadcast-core] recipient delivery threw:',
+              err instanceof Error ? err.message : err
+            );
+          });
+        }
+      })
+    );
+  } finally {
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
   }
 
   await finalizeBroadcastStatus(db, plan.broadcastId);
