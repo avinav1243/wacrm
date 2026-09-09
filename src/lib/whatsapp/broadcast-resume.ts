@@ -20,6 +20,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { BroadcastError, type BroadcastPlan } from '@/lib/whatsapp/broadcast-core';
 import { MAX_BROADCAST_RECIPIENTS } from '@/lib/broadcast-limits';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
 import { decrypt } from '@/lib/whatsapp/encryption';
 import { resolveTemplateRow } from '@/lib/whatsapp/template-body';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
@@ -44,12 +45,35 @@ export const RESUME_SCOPES: readonly ResumeScope[] = [
 export const RESUME_MAX_PER_REQUEST = MAX_BROADCAST_RECIPIENTS;
 
 /**
- * How long a `delivery_locked_at` stamp is honoured before it is read
- * as abandoned. Long enough that a legitimately slow pass is never
- * stolen from, short enough that a crashed one doesn't wedge the
- * campaign until someone touches the database.
+ * How often a running pass re-stamps `delivery_locked_at` to prove it is
+ * still alive. Must divide {@link DELIVERY_LOCK_STALE_MS} several times
+ * over, so a couple of transient failures don't look like a dead process.
  */
-export const DELIVERY_LOCK_STALE_MS = 30 * 60 * 1000;
+export const DELIVERY_HEARTBEAT_MS = 30 * 1000;
+
+/**
+ * How long a `delivery_locked_at` stamp is honoured before it is read
+ * as abandoned.
+ *
+ * The lock is a DB column, so it outlives the process that took it: if
+ * the server restarts mid-fan-out, the release in the route's `finally`
+ * never runs and the stamp survives. Restarting therefore cannot clear
+ * it — only this window elapsing can, which is why a 30-minute window
+ * left operators staring at "a delivery pass is already running" long
+ * after there was no such pass.
+ *
+ * A live pass now re-stamps the lock every {@link DELIVERY_HEARTBEAT_MS}
+ * (see `deliverBroadcast`'s `onHeartbeat`), so liveness is proven
+ * continuously rather than assumed from the claim time. That decouples
+ * the window from how long a send takes and lets it be short: four
+ * consecutive missed heartbeats mean the process is genuinely gone.
+ *
+ * Both failure modes are covered by that pairing — a crashed pass frees
+ * itself in ~2 minutes, and a legitimately slow one (a full 10,000-
+ * recipient send) can never be stolen out from under itself and
+ * double-message everyone still pending.
+ */
+export const DELIVERY_LOCK_STALE_MS = 2 * 60 * 1000;
 
 function scopeStatuses(scope: ResumeScope): string[] {
   if (scope === 'pending') return ['pending'];
@@ -101,6 +125,31 @@ export async function releaseBroadcastDelivery(
     .eq('id', broadcastId);
   if (error) {
     console.error('[broadcast-resume] release failed:', error.message);
+  }
+}
+
+/**
+ * Re-stamp the delivery lock to prove the pass is still running.
+ *
+ * Called on a timer by `deliverBroadcast` for the duration of a pass.
+ * Without it the lock's age measures "when the pass started" rather than
+ * "when it was last known alive", so any window short enough to recover
+ * a crash was also short enough for a second Resume to steal the lock
+ * from a healthy long-running send.
+ *
+ * Best-effort: one failed heartbeat is harmless (the window tolerates
+ * several), and the pass must not abort because a keepalive write lost.
+ */
+export async function touchBroadcastDelivery(
+  db: SupabaseClient,
+  broadcastId: string
+): Promise<void> {
+  const { error } = await db
+    .from('broadcasts')
+    .update({ delivery_locked_at: new Date().toISOString() })
+    .eq('id', broadcastId);
+  if (error) {
+    console.error('[broadcast-resume] heartbeat failed:', error.message);
   }
 }
 
@@ -157,14 +206,26 @@ export async function planBroadcastResume(
   }
 
   const statuses = scopeStatuses(scope);
-  const { data: rawRows, error: recError } = await db
-    .from('broadcast_recipients')
-    .select('id, template_params, contact:contacts(phone)')
-    .eq('broadcast_id', broadcastId)
-    .in('status', statuses)
-    // Oldest first, so repeated capped passes chew through the backlog
-    // in a stable order instead of re-picking the same slice.
-    .order('created_at', { ascending: true });
+  // Page past PostgREST's 1,000-row cap. A single unpaginated select
+  // silently returned only the first 1,000 outstanding recipients, so
+  // resuming a broadcast larger than that (e.g. 6,657) picked up 1,000,
+  // reported "0 remaining", and left thousands stranded 'pending'. The
+  // sort must be a deterministic total order or offset paging duplicates
+  // and drops rows: created_at is the transaction timestamp shared by
+  // every row this broadcast inserted, so id is the real tiebreaker.
+  const { data: rawRows, error: recError } =
+    await fetchAllRows<RecipientRow>((from, to) =>
+      db
+        .from('broadcast_recipients')
+        .select('id, template_params, contact:contacts(phone)')
+        .eq('broadcast_id', broadcastId)
+        .in('status', statuses)
+        // Oldest first, so repeated capped passes chew through the backlog
+        // in a stable order instead of re-picking the same slice.
+        .order('created_at', { ascending: true })
+        .order('id', { ascending: true })
+        .range(from, to),
+    );
 
   if (recError) {
     console.error('[broadcast-resume] recipient load failed:', recError.message);
