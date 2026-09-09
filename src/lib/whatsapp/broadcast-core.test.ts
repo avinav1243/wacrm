@@ -5,6 +5,7 @@ import {
   finalizeBroadcastStatus,
   BroadcastError,
 } from './broadcast-core';
+import { MAX_BROADCAST_RECIPIENTS } from '@/lib/broadcast-limits';
 
 // Contact resolution and token decryption are exercised elsewhere — stub
 // them so these tests focus on the persistence boundary.
@@ -38,10 +39,11 @@ describe('createBroadcast validation', () => {
     ).rejects.toBeInstanceOf(BroadcastError);
   });
 
-  it('rejects more than 1000 recipients', async () => {
-    const recipients = Array.from({ length: 1001 }, () => ({
-      to: '+14155550123',
-    }));
+  it('rejects more than the recipient cap', async () => {
+    const recipients = Array.from(
+      { length: MAX_BROADCAST_RECIPIENTS + 1 },
+      () => ({ to: '+14155550123' }),
+    );
     await expect(
       createBroadcast(db, 'acc', 'user', { templateName: 'promo', recipients })
     ).rejects.toMatchObject({ status: 400 });

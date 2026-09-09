@@ -38,7 +38,18 @@ import {
   RATE_LIMITS,
 } from '@/lib/rate-limit';
 
-// The fan-out below is sequential over up to 1 000 recipients.
+// The fan-out below is sequential over up to MAX_BROADCAST_RECIPIENTS
+// (10,000) recipients inside after(), self-paced (see deliverBroadcast).
+//
+// maxDuration is only read by serverless deployment platforms (per the
+// Next.js docs, "Deployment platforms can use maxDuration from the build
+// output to add specific execution limits"). This app is self-hosted on
+// a long-lived Node server (output:'standalone', `node server.js`), where
+// after() runs to completion in-process and nothing enforces this value —
+// so it is effectively inert here. It is kept as an honest hint: a full
+// paced 10,000-recipient send takes tens of minutes and would exceed any
+// serverless limit, so this route must run on a long-lived server, never
+// a serverless function.
 export const maxDuration = 300;
 
 export async function POST(

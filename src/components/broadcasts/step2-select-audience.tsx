@@ -2,6 +2,8 @@
 
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
+import { MAX_BROADCAST_RECIPIENTS } from '@/lib/broadcast-limits';
 import { parseBroadcastCsv } from '@/lib/broadcast-csv';
 import { CustomField, Tag } from '@/types';
 import { Button } from '@/components/ui/button';
@@ -155,10 +157,23 @@ export function Step2SelectAudience({
         audience.tagIds &&
         audience.tagIds.length > 0
       ) {
-        const { data } = await supabase
-          .from('contact_tags')
-          .select('contact_id')
-          .in('tag_id', audience.tagIds);
+        // Page past PostgREST's 1,000-row cap so the estimate equals
+        // what the send will actually resolve. An unpaginated read here
+        // capped at 1,000 for any tag with more members — the mismatch
+        // behind "1,978 shown / 1,000 sent".
+        const { data, error } = await fetchAllRows<{ contact_id: string }>(
+          (from, to) =>
+            supabase
+              .from('contact_tags')
+              .select('contact_id')
+              .in('tag_id', audience.tagIds!)
+              .range(from, to),
+        );
+        if (error) {
+          console.error('[step2] tag estimate failed:', error.message);
+          setEstimatedCount(null);
+          return;
+        }
         baseIds = new Set((data ?? []).map((r) => r.contact_id));
       } else if (
         audience.type === 'custom_field' &&
@@ -166,14 +181,23 @@ export function Step2SelectAudience({
         audience.customField.value
       ) {
         const { fieldId, operator, value } = audience.customField;
-        let q = supabase
-          .from('contact_custom_values')
-          .select('contact_id')
-          .eq('custom_field_id', fieldId);
-        if (operator === 'is') q = q.eq('value', value);
-        else if (operator === 'is_not') q = q.neq('value', value);
-        else q = q.ilike('value', `%${value}%`);
-        const { data } = await q;
+        const { data, error } = await fetchAllRows<{ contact_id: string }>(
+          (from, to) => {
+            let q = supabase
+              .from('contact_custom_values')
+              .select('contact_id')
+              .eq('custom_field_id', fieldId);
+            if (operator === 'is') q = q.eq('value', value);
+            else if (operator === 'is_not') q = q.neq('value', value);
+            else q = q.ilike('value', `%${value}%`);
+            return q.range(from, to);
+          },
+        );
+        if (error) {
+          console.error('[step2] custom-field estimate failed:', error.message);
+          setEstimatedCount(null);
+          return;
+        }
         baseIds = new Set((data ?? []).map((r) => r.contact_id));
       } else if (
         audience.type === 'csv' &&
@@ -191,10 +215,20 @@ export function Step2SelectAudience({
       // Apply exclude tags
       let excludeSet: Set<string> | null = null;
       if (audience.excludeTagIds && audience.excludeTagIds.length > 0) {
-        const { data: excludeRows } = await supabase
-          .from('contact_tags')
-          .select('contact_id')
-          .in('tag_id', audience.excludeTagIds);
+        const { data: excludeRows, error: excludeError } = await fetchAllRows<{
+          contact_id: string;
+        }>((from, to) =>
+          supabase
+            .from('contact_tags')
+            .select('contact_id')
+            .in('tag_id', audience.excludeTagIds!)
+            .range(from, to),
+        );
+        if (excludeError) {
+          console.error('[step2] exclude estimate failed:', excludeError.message);
+          setEstimatedCount(null);
+          return;
+        }
         excludeSet = new Set((excludeRows ?? []).map((r) => r.contact_id));
       }
 
@@ -284,6 +318,12 @@ export function Step2SelectAudience({
     (audience.type === 'csv' &&
       audience.csvContacts &&
       audience.csvContacts.length > 0);
+
+  // Block advancing a send we already know the server will refuse. The
+  // estimate is computed from the actual id sets above, so it's accurate
+  // enough to gate on; null (loading / not configured) never blocks.
+  const overCap =
+    estimatedCount !== null && estimatedCount > MAX_BROADCAST_RECIPIENTS;
 
   return (
     <div className="space-y-6">
@@ -528,6 +568,13 @@ export function Step2SelectAudience({
             Select an audience type to see the estimate.
           </p>
         )}
+        {overCap && (
+          <p className="mt-2 text-xs text-red-400">
+            This exceeds the {MAX_BROADCAST_RECIPIENTS.toLocaleString()}-recipient
+            limit for a single broadcast. Narrow the audience with tags or a
+            filter, or split it into multiple sends.
+          </p>
+        )}
       </div>
 
       <div className="flex items-center justify-between border-t border-border pt-4">
@@ -541,7 +588,7 @@ export function Step2SelectAudience({
         </Button>
         <Button
           onClick={onNext}
-          disabled={!isValid}
+          disabled={!isValid || overCap}
           className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
           {t('next')}

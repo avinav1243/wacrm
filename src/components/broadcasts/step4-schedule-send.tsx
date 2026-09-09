@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
+import { fetchAllRows } from '@/lib/supabase/fetch-all';
+import { MAX_BROADCAST_RECIPIENTS } from '@/lib/broadcast-limits';
 import { MessageTemplate } from '@/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -20,7 +22,13 @@ import { useTranslations } from 'next-intl';
 interface AudienceConfig {
   type: string;
   tagIds?: string[];
+  customField?: {
+    fieldId: string;
+    operator: 'is' | 'is_not' | 'contains';
+    value: string;
+  };
   csvContacts?: { phone: string; name?: string }[];
+  excludeTagIds?: string[];
 }
 
 interface Step4Props {
@@ -57,23 +65,97 @@ export function Step4ScheduleSend({
       try {
         const supabase = createClient();
 
+        // Base id set before excludes; null means "all contacts".
+        let baseIds: Set<string> | null = null;
+
         if (audience.type === 'all') {
+          // Handled below via an exact count.
+        } else if (
+          audience.type === 'tags' &&
+          audience.tagIds &&
+          audience.tagIds.length > 0
+        ) {
+          // Page past PostgREST's 1,000-row cap so this final confirmation
+          // matches what the send resolves — an unpaginated read capped at
+          // 1,000, the mismatch behind "1,978 shown / 1,000 sent".
+          const { data, error } = await fetchAllRows<{ contact_id: string }>(
+            (from, to) =>
+              supabase
+                .from('contact_tags')
+                .select('contact_id')
+                .in('tag_id', audience.tagIds!)
+                .range(from, to),
+          );
+          if (error) {
+            console.error('[step4] tag reach failed:', error.message);
+            setEstimatedReach(0);
+            return;
+          }
+          baseIds = new Set((data ?? []).map((ct) => ct.contact_id));
+        } else if (
+          audience.type === 'custom_field' &&
+          audience.customField?.fieldId &&
+          audience.customField.value
+        ) {
+          // Previously unhandled here — a custom-field audience showed
+          // "0" reach and the confirm dialog said "0 contacts".
+          const { fieldId, operator, value } = audience.customField;
+          const { data, error } = await fetchAllRows<{ contact_id: string }>(
+            (from, to) => {
+              let q = supabase
+                .from('contact_custom_values')
+                .select('contact_id')
+                .eq('custom_field_id', fieldId);
+              if (operator === 'is') q = q.eq('value', value);
+              else if (operator === 'is_not') q = q.neq('value', value);
+              else q = q.ilike('value', `%${value}%`);
+              return q.range(from, to);
+            },
+          );
+          if (error) {
+            console.error('[step4] custom-field reach failed:', error.message);
+            setEstimatedReach(0);
+            return;
+          }
+          baseIds = new Set((data ?? []).map((m) => m.contact_id));
+        } else if (audience.type === 'csv' && audience.csvContacts) {
+          setEstimatedReach(audience.csvContacts.length);
+          return;
+        } else {
+          setEstimatedReach(0);
+          return;
+        }
+
+        // Exclude tags apply to every contact-derived audience.
+        let excludeSet: Set<string> | null = null;
+        if (audience.excludeTagIds && audience.excludeTagIds.length > 0) {
+          const { data: excludeRows, error: excludeError } =
+            await fetchAllRows<{ contact_id: string }>((from, to) =>
+              supabase
+                .from('contact_tags')
+                .select('contact_id')
+                .in('tag_id', audience.excludeTagIds!)
+                .range(from, to),
+            );
+          if (excludeError) {
+            console.error('[step4] exclude reach failed:', excludeError.message);
+            setEstimatedReach(0);
+            return;
+          }
+          excludeSet = new Set((excludeRows ?? []).map((r) => r.contact_id));
+        }
+
+        if (baseIds) {
+          const effective = [...baseIds].filter((id) => !excludeSet?.has(id));
+          setEstimatedReach(effective.length);
+        } else {
           const { count } = await supabase
             .from('contacts')
             .select('*', { count: 'exact', head: true });
-          setEstimatedReach(count ?? 0);
-        } else if (audience.type === 'tags' && audience.tagIds && audience.tagIds.length > 0) {
-          const { data: contactTags } = await supabase
-            .from('contact_tags')
-            .select('contact_id')
-            .in('tag_id', audience.tagIds);
-
-          const uniqueIds = new Set((contactTags ?? []).map((ct) => ct.contact_id));
-          setEstimatedReach(uniqueIds.size);
-        } else if (audience.type === 'csv' && audience.csvContacts) {
-          setEstimatedReach(audience.csvContacts.length);
-        } else {
-          setEstimatedReach(0);
+          const total = count ?? 0;
+          setEstimatedReach(
+            excludeSet ? Math.max(0, total - excludeSet.size) : total,
+          );
         }
       } finally {
         setLoadingReach(false);
@@ -82,6 +164,12 @@ export function Step4ScheduleSend({
 
     calculateReach();
   }, [audience]);
+
+  // The server hard-caps a send at MAX_BROADCAST_RECIPIENTS; block the
+  // confirm here so the user isn't walked to the send button only to be
+  // refused. The reach is computed from the actual id sets, so gating on
+  // it is safe.
+  const overCap = !loadingReach && estimatedReach > MAX_BROADCAST_RECIPIENTS;
 
   const audienceLabel =
     audience.type === 'all'
@@ -142,6 +230,14 @@ export function Step4ScheduleSend({
             <p className="text-foreground">{template.language ?? 'en_US'}</p>
           </div>
         </div>
+        {overCap && (
+          <p className="text-xs text-red-400">
+            This audience of {estimatedReach.toLocaleString()} exceeds the{' '}
+            {MAX_BROADCAST_RECIPIENTS.toLocaleString()}-recipient limit for a
+            single broadcast. Go back and narrow the audience with tags or a
+            filter, or split it into multiple sends.
+          </p>
+        )}
       </div>
 
       {/* Processing overlay */}
@@ -191,7 +287,7 @@ export function Step4ScheduleSend({
           <DialogTrigger
             render={
               <Button
-                disabled={!name.trim() || isProcessing}
+                disabled={!name.trim() || isProcessing || overCap}
                 className="bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
               />
             }
