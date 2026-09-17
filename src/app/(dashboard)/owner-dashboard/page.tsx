@@ -306,7 +306,7 @@ export default function OwnerDashboardPage() {
           <div className="grid gap-4 md:grid-cols-3">
             <StatCard
               title={t('sentTotal')}
-              value={reportReady.totals.sent}
+              value={reportReady.totals.total}
               icon={Send}
               accent="text-sky-400"
               bg="bg-sky-500/10"

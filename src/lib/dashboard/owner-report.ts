@@ -8,12 +8,13 @@ import type {
 
 type DB = SupabaseClient
 
-type BroadcastRow = {
+type BroadcastReportRow = {
+  total_recipients: number | null
   sent_count: number | null
   delivered_count: number | null
   failed_count: number | null
   template_name: string | null
-  updated_at: string
+  created_at: string
 }
 
 type TemplateRow = {
@@ -53,30 +54,37 @@ function classifyMessage(templateCategory: string | null | undefined): 'marketin
   return templateCategory === 'Marketing' ? 'marketing' : 'utilityAuthentication'
 }
 
+function isInRange(iso: string | null, start: string, endExclusive: string): boolean {
+  return Boolean(iso && iso >= start && iso < endExclusive)
+}
+
 /**
- * Aggregate the owner's outbound delivery report from row data.
+ * Aggregate the owner's outbound delivery report from broadcast row data.
  *
  * Marketing is only the marketing template bucket. Utility /
  * authentication also absorbs non-template operational sends so the
- * report stays complete even when the message row has no template name.
+ * report stays complete even when the broadcast row has no template name.
  */
 export function buildOwnerMessageReport(
-  messages: BroadcastRow[],
+  broadcasts: BroadcastReportRow[],
   templateCategories: Map<string, string>,
   range: OwnerMessageReport['range'],
 ): OwnerMessageReport {
   const report = createEmptyOwnerMessageReport(range)
 
-  for (const row of messages) {
+  for (const row of broadcasts) {
+    if (!isInRange(row.created_at, range.start, range.end)) continue
+
+    const totalRecipients = row.total_recipients ?? 0
     const sent = row.sent_count ?? 0
     const delivered = row.delivered_count ?? 0
     const failed = row.failed_count ?? 0
-    if (sent === 0) continue
+    if (totalRecipients === 0) continue
 
     addCount(report.totals, 'sent', sent)
     addCount(report.totals, 'delivered', delivered)
     addCount(report.totals, 'failed', failed)
-    report.totals.total += sent
+    report.totals.total += totalRecipients
 
     const category = row.template_name
       ? classifyMessage(templateCategories.get(row.template_name))
@@ -85,7 +93,7 @@ export function buildOwnerMessageReport(
     addCount(report[category], 'sent', sent)
     addCount(report[category], 'delivered', delivered)
     addCount(report[category], 'failed', failed)
-    report[category].total += sent
+    report[category].total += totalRecipients
   }
 
   return report
@@ -98,15 +106,15 @@ export async function loadOwnerMessageReport(
   const start = range.start.toISOString()
   const endExclusive = new Date(range.end)
   endExclusive.setDate(endExclusive.getDate() + 1)
-  const activityTimestampColumn = 'updated_at'
+  const end = endExclusive.toISOString()
 
   const [broadcastsRes, templatesRes] = await Promise.all([
     db
       .from('broadcasts')
-      .select('template_name, updated_at, sent_count, delivered_count, failed_count')
-      .gte(activityTimestampColumn, start)
-      .lt(activityTimestampColumn, endExclusive.toISOString())
-      .order(activityTimestampColumn, { ascending: true }),
+      .select('template_name, created_at, total_recipients, sent_count, delivered_count, failed_count')
+      .gte('created_at', start)
+      .lt('created_at', end)
+      .order('created_at', { ascending: true }),
     db.from('message_templates').select('name, category'),
   ])
 
@@ -122,11 +130,11 @@ export async function loadOwnerMessageReport(
   }
 
   return buildOwnerMessageReport(
-    (broadcastsRes.data ?? []) as BroadcastRow[],
+    (broadcastsRes.data ?? []) as BroadcastReportRow[],
     templateCategories,
     {
       start: range.start.toISOString(),
-      end: endExclusive.toISOString(),
+      end,
     },
   )
 }

@@ -6,6 +6,9 @@ import {
   claimBroadcastDelivery,
   planBroadcastResume,
   releaseBroadcastDelivery,
+  touchBroadcastDelivery,
+  DELIVERY_HEARTBEAT_MS,
+  DELIVERY_LOCK_STALE_MS,
   RESUME_MAX_PER_REQUEST,
 } from './broadcast-resume';
 
@@ -79,16 +82,35 @@ describe('claimBroadcastDelivery', () => {
 
   it('treats a lock older than the staleness window as abandoned', async () => {
     const calls: ClaimCall[] = [];
+    const now = new Date('2026-08-11T12:00:00Z');
     await claimBroadcastDelivery(
       claimDb([{ id: 'bc-1' }], calls),
       'acct-1',
       'bc-1',
-      new Date('2026-08-11T12:00:00Z'),
+      now,
     );
-    // 30 minutes before "now" — a pass whose process died is recoverable
-    // without touching the database by hand.
+    // The cutoff is derived from the constant rather than hard-coded, so
+    // tuning the window can't silently leave this test asserting the old
+    // one. A pass whose process died is recoverable without touching the
+    // database by hand.
+    const cutoff = new Date(
+      now.getTime() - DELIVERY_LOCK_STALE_MS,
+    ).toISOString();
     expect(calls[0].or).toBe(
-      'delivery_locked_at.is.null,delivery_locked_at.lt.2026-08-11T11:30:00.000Z',
+      `delivery_locked_at.is.null,delivery_locked_at.lt.${cutoff}`,
+    );
+  });
+
+  it('expires an abandoned lock quickly enough to be usable after a restart', async () => {
+    // The lock lives in the database, so it survives the process that
+    // took it: a server restart mid-fan-out leaves the stamp behind and
+    // Resume stays refused until the window elapses. It used to be 30
+    // minutes, which read to operators as "restarting doesn't help".
+    expect(DELIVERY_LOCK_STALE_MS).toBeLessThanOrEqual(5 * 60 * 1000);
+    // ...but a live pass proves itself on a much shorter cadence, so a
+    // couple of dropped heartbeats can never look like a dead process.
+    expect(DELIVERY_HEARTBEAT_MS * 3).toBeLessThanOrEqual(
+      DELIVERY_LOCK_STALE_MS,
     );
   });
 
@@ -105,6 +127,25 @@ describe('releaseBroadcastDelivery', () => {
     await releaseBroadcastDelivery(claimDb([], calls), 'bc-1');
     expect(calls[0].update).toEqual({ delivery_locked_at: null });
     expect(calls[0].filters).toEqual({ id: 'bc-1' });
+  });
+});
+
+describe('touchBroadcastDelivery', () => {
+  it('re-stamps the lock so a long pass is never judged abandoned', async () => {
+    const calls: ClaimCall[] = [];
+    const before = Date.now();
+    await touchBroadcastDelivery(claimDb([], calls), 'bc-1');
+
+    expect(calls[0].filters).toEqual({ id: 'bc-1' });
+    const stamped = Date.parse(
+      calls[0].update.delivery_locked_at as string,
+    );
+    expect(stamped).toBeGreaterThanOrEqual(before);
+    // Crucially it does NOT filter on account_id or on the lock's
+    // current value: the pass already proved ownership when it claimed
+    // the lock, and a heartbeat that could fail to match would let a
+    // healthy send lose a lock it legitimately holds.
+    expect(calls[0].or).toBeUndefined();
   });
 });
 
@@ -128,10 +169,20 @@ interface PlanWrites {
 function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
   return {
     from(table: string) {
+      // Per-builder range window, so fetchAllRows can page the recipient
+      // read. A fresh from() → fresh window, so the unsendable UPDATE
+      // (also on broadcast_recipients) never inherits a stale range.
+      let rangeFrom: number | null = null;
+      let rangeTo: number | null = null;
       const b: Record<string, unknown> = {
         select: () => b,
         eq: () => b,
         order: () => b,
+        range: (from: number, to: number) => {
+          rangeFrom = from;
+          rangeTo = to;
+          return b;
+        },
         in: (col: string, vals: unknown) => {
           if (col === 'status') writes.statusFilter = vals;
           if (col === 'id') writes.failedIds = vals;
@@ -151,7 +202,15 @@ function planDb(fx: PlanFixture, writes: PlanWrites = {}): SupabaseClient {
         }),
         then: (resolve: (r: { data: unknown[]; error: null }) => unknown) => {
           if (table === 'broadcast_recipients') {
-            return resolve({ data: fx.recipients ?? [], error: null });
+            const all = fx.recipients ?? [];
+            // Emulate PostgREST: an unbounded select is truncated to 1,000
+            // with no error (the whole reason resume must page), while a
+            // .range(from,to) returns exactly that inclusive window.
+            const page =
+              rangeFrom === null
+                ? all.slice(0, 1000)
+                : all.slice(rangeFrom, rangeTo! + 1);
+            return resolve({ data: page, error: null });
           }
           if (table === 'message_templates') {
             return resolve({ data: fx.templates ?? [], error: null });
@@ -303,6 +362,26 @@ describe('planBroadcastResume', () => {
     expect(writes.failedIds).toEqual(['r2', 'r3']);
     expect(writes.failedUpdate?.status).toBe('failed');
     expect(plan.planned).toHaveLength(1);
+  });
+
+  it('reads every outstanding recipient past the 1,000-row cap', async () => {
+    // The 6,657-recipient report: a single unpaginated select stops at
+    // 1,000, so resume picked up 1,000, reported "0 remaining", and left
+    // the rest stranded 'pending'. planBroadcastResume must page. The mock
+    // truncates an un-ranged read to 1,000 (as PostgREST does), so this
+    // length is only reachable if fetchAllRows walked every page.
+    const many = Array.from({ length: 2345 }, (_, i) =>
+      recipient(`r${i}`, '+1555' + String(2000000 + i)),
+    );
+    const { plan, remaining } = await planBroadcastResume(
+      planDb({ broadcast: BROADCAST, config: CONFIG, recipients: many }),
+      'acct-1',
+      'bc-1',
+      'pending',
+    );
+    // All 2,345 are under the 10,000 per-pass cap, so every one is planned.
+    expect(plan.planned).toHaveLength(2345);
+    expect(remaining).toBe(0);
   });
 
   it('caps one pass and reports the leftover', async () => {
