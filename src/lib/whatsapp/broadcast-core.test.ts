@@ -1,10 +1,13 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   createBroadcast,
+  deliverBroadcast,
   finalizeBroadcastStatus,
   BroadcastError,
+  type BroadcastPlan,
 } from './broadcast-core';
+import { sendTemplateMessage } from '@/lib/whatsapp/meta-api';
 import { MAX_BROADCAST_RECIPIENTS } from '@/lib/broadcast-limits';
 
 // Contact resolution and token decryption are exercised elsewhere — stub
@@ -15,6 +18,13 @@ vi.mock('@/lib/whatsapp/encryption', () => ({
 vi.mock('@/lib/api/v1/contacts', () => ({
   findOrCreateContact: vi.fn(async () => ({ id: 'c1' })),
 }));
+// The fan-out's only outbound call. Stubbing it lets the pool tests below
+// observe concurrency, ordering, and per-recipient failure without a
+// network round-trip.
+vi.mock('@/lib/whatsapp/meta-api', () => ({
+  sendTemplateMessage: vi.fn(),
+}));
+const sendMock = vi.mocked(sendTemplateMessage);
 
 // These assertions all fire in the pure validation prologue, before
 // any Supabase call — a bare stub is enough.
@@ -218,5 +228,276 @@ describe('finalizeBroadcastStatus', () => {
       'b-1',
     );
     expect(writes.update?.status).toBe('sent');
+  });
+});
+
+// ============================================================
+// deliverBroadcast — the concurrent, rate-metered fan-out.
+//
+// The pool replaced a strictly-sequential loop in which one slow (or
+// hung) Meta call froze every remaining recipient. These tests pin the
+// properties that make the pool safe: no recipient is dropped or sent
+// twice, in-flight sends never exceed `concurrency`, one failed send
+// never strands the rest, and the liveness heartbeat runs for exactly as
+// long as the pass does.
+// ============================================================
+
+interface DeliverRecord {
+  updates: { id: string; row: Record<string, unknown> }[];
+}
+
+// A Supabase-shaped mock covering both operations deliverBroadcast
+// performs: the per-recipient row stamp (a broadcast_recipients UPDATE …
+// eq('id')) and finalizeBroadcastStatus's count reads. Count reads report
+// nothing pending so finalize proceeds without any of these tests having
+// to model the terminal-status arithmetic (that lives in its own suite).
+function deliverDb(record: DeliverRecord): SupabaseClient {
+  return {
+    from(table: string) {
+      let isSelect = false;
+      let updateRow: Record<string, unknown> | null = null;
+      let rowId: string | null = null;
+      const b: Record<string, unknown> = {
+        select: () => {
+          isSelect = true;
+          return b;
+        },
+        update: (row: Record<string, unknown>) => {
+          updateRow = row;
+          return b;
+        },
+        eq: (col: string, val: unknown) => {
+          if (col === 'id' && table === 'broadcast_recipients') {
+            rowId = val as string;
+          }
+          return b;
+        },
+        then: (resolve: (r: unknown) => unknown) => {
+          if (isSelect) return resolve({ count: 0, error: null });
+          if (table === 'broadcast_recipients' && updateRow && rowId) {
+            record.updates.push({ id: rowId, row: updateRow });
+          }
+          return resolve({ error: null });
+        },
+      };
+      return b;
+    },
+  } as unknown as SupabaseClient;
+}
+
+function makePlan(n: number): BroadcastPlan {
+  return {
+    broadcastId: 'b-1',
+    templateName: 'promo',
+    templateLanguage: 'en_US',
+    phoneNumberId: 'pn-1',
+    accessToken: 'tok',
+    templateRow: null,
+    planned: Array.from({ length: n }, (_, i) => ({
+      recipientRowId: `r${i}`,
+      // Distinct, so a per-recipient reject can be keyed by phone and no
+      // phoneVariants trunk-0 permutation collides with another number.
+      phone: `1555${1000000 + i}`,
+      params: [],
+    })),
+    rejected: 0,
+  };
+}
+
+describe('deliverBroadcast pool', () => {
+  beforeEach(() => {
+    sendMock.mockReset();
+  });
+
+  it('delivers every planned recipient exactly once — no drops, no doubles', async () => {
+    sendMock.mockImplementation(async () => ({ messageId: 'wamid.OK' }));
+    const record: DeliverRecord = { updates: [] };
+    const plan = makePlan(25);
+
+    await deliverBroadcast(deliverDb(record), plan, {
+      maxPerSecond: 0,
+      concurrency: 8,
+    });
+
+    // One send per recipient (the first phone variant succeeds).
+    expect(sendMock).toHaveBeenCalledTimes(25);
+    // Every recipient row stamped once, all 'sent', ids exactly the plan.
+    expect(record.updates).toHaveLength(25);
+    expect(record.updates.every((u) => u.row.status === 'sent')).toBe(true);
+    expect(new Set(record.updates.map((u) => u.id))).toEqual(
+      new Set(plan.planned.map((p) => p.recipientRowId)),
+    );
+  });
+
+  it('never runs more than `concurrency` sends in flight', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    sendMock.mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      // A real macrotask so overlapping sends genuinely coexist.
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--;
+      return { messageId: 'wamid.OK' };
+    });
+
+    await deliverBroadcast(deliverDb({ updates: [] }), makePlan(20), {
+      maxPerSecond: 0,
+      concurrency: 4,
+    });
+
+    expect(peak).toBeLessThanOrEqual(4);
+    // ...and it really did fan out, rather than accidentally serializing.
+    expect(peak).toBeGreaterThan(1);
+  });
+
+  it('caps workers at the recipient count for a tiny plan', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    sendMock.mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 1));
+      inFlight--;
+      return { messageId: 'wamid.OK' };
+    });
+
+    await deliverBroadcast(deliverDb({ updates: [] }), makePlan(2), {
+      maxPerSecond: 0,
+      concurrency: 8,
+    });
+
+    // Only 2 recipients, so at most 2 sends can ever overlap.
+    expect(peak).toBeLessThanOrEqual(2);
+  });
+
+  it('stamps a failed send and still delivers the rest (the freeze regression)', async () => {
+    const plan = makePlan(5);
+    const doomedPhone = plan.planned[2].phone;
+    sendMock.mockImplementation(async (args: { to: string }) => {
+      if (args.to === doomedPhone) {
+        throw new Error('permanent failure from Meta');
+      }
+      return { messageId: 'wamid.OK' };
+    });
+    const record: DeliverRecord = { updates: [] };
+
+    await deliverBroadcast(deliverDb(record), plan, {
+      maxPerSecond: 0,
+      concurrency: 3,
+    });
+
+    const byId = new Map(record.updates.map((u) => [u.id, u.row]));
+    expect(byId.get('r2')?.status).toBe('failed');
+    expect(byId.get('r2')?.error_message).toBe('permanent failure from Meta');
+    // The other four were not stranded behind the failure.
+    for (const i of [0, 1, 3, 4]) {
+      expect(byId.get(`r${i}`)?.status).toBe('sent');
+    }
+    expect(record.updates).toHaveLength(5);
+  });
+
+  it('one worker throwing (a DB fault) does not strand the rest of its queue', async () => {
+    sendMock.mockImplementation(async () => ({ messageId: 'wamid.OK' }));
+    const record: DeliverRecord = { updates: [] };
+    const plan = makePlan(6);
+    // A db whose recipient UPDATE throws for one row — this escapes
+    // deliverOne, and the worker's .catch must swallow it so the shared
+    // cursor keeps feeding the remaining recipients.
+    const db = {
+      from(table: string) {
+        let isSelect = false;
+        let updateRow: Record<string, unknown> | null = null;
+        let rowId: string | null = null;
+        const b: Record<string, unknown> = {
+          select: () => {
+            isSelect = true;
+            return b;
+          },
+          update: (row: Record<string, unknown>) => {
+            updateRow = row;
+            return b;
+          },
+          eq: (col: string, val: unknown) => {
+            if (col === 'id' && table === 'broadcast_recipients') {
+              rowId = val as string;
+            }
+            return b;
+          },
+          then: (
+            resolve: (r: unknown) => unknown,
+            reject: (e: unknown) => unknown,
+          ) => {
+            if (isSelect) return resolve({ count: 0, error: null });
+            if (rowId === 'r3') return reject(new Error('db write blew up'));
+            if (table === 'broadcast_recipients' && updateRow && rowId) {
+              record.updates.push({ id: rowId, row: updateRow });
+            }
+            return resolve({ error: null });
+          },
+        };
+        return b;
+      },
+    } as unknown as SupabaseClient;
+
+    await expect(
+      deliverBroadcast(db, plan, { maxPerSecond: 0, concurrency: 2 }),
+    ).resolves.toBeUndefined();
+
+    // r3's stamp threw, so it isn't recorded — but all five others are.
+    expect(record.updates.map((u) => u.id).sort()).toEqual([
+      'r0',
+      'r1',
+      'r2',
+      'r4',
+      'r5',
+    ]);
+  });
+
+  it('fires onHeartbeat on its interval during the pass and clears it after', async () => {
+    vi.useFakeTimers();
+    try {
+      // Park every send on a gate we control, so the pass stays in flight
+      // while we advance the clock across several heartbeat intervals.
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      sendMock.mockImplementation(async () => {
+        await gate;
+        return { messageId: 'wamid.OK' };
+      });
+      const heartbeat = vi.fn(async () => {});
+
+      const pass = deliverBroadcast(deliverDb({ updates: [] }), makePlan(1), {
+        maxPerSecond: 0,
+        onHeartbeat: heartbeat,
+        heartbeatIntervalMs: 1000,
+      });
+
+      await vi.advanceTimersByTimeAsync(3500);
+      expect(heartbeat).toHaveBeenCalledTimes(3);
+
+      release();
+      await pass;
+
+      // The finally cleared the interval, so the clock advancing further
+      // produces no more keepalives.
+      const settled = heartbeat.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(heartbeat.mock.calls.length).toBe(settled);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does no keepalive writes when no onHeartbeat is supplied', async () => {
+    sendMock.mockImplementation(async () => ({ messageId: 'wamid.OK' }));
+    // Simply must not throw when the timer is never created.
+    await expect(
+      deliverBroadcast(deliverDb({ updates: [] }), makePlan(3), {
+        maxPerSecond: 0,
+      }),
+    ).resolves.toBeUndefined();
   });
 });
