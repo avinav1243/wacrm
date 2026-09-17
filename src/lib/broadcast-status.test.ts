@@ -25,6 +25,24 @@ describe("getBroadcastStatus", () => {
     expect(getBroadcastStatus("")).toBe(broadcastStatusConfig.draft);
   });
 
+  it("shows sending as sent when no recipients remain pending", () => {
+    expect(
+      getBroadcastStatus("sending", { total: 3, sent: 2, failed: 1 }),
+    ).toBe(broadcastStatusConfig.sent);
+  });
+
+  it("shows an all-failed broadcast as sent until its status settles", () => {
+    expect(
+      getBroadcastStatus("sending", { total: 3, sent: 0, failed: 3 }),
+    ).toBe(broadcastStatusConfig.sent);
+  });
+
+  it("shows an empty sending broadcast as sent", () => {
+    expect(
+      getBroadcastStatus("sending", { total: 0, sent: 0, failed: 0 }),
+    ).toBe(broadcastStatusConfig.sent);
+  });
+
   it("each variant has the dark-theme class triple", () => {
     // Accept both fixed-shade Tailwind names (bg-red-500/10) and
     // token-backed names without a shade number (bg-primary/10) since

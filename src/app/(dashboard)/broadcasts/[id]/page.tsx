@@ -406,10 +406,13 @@ export default function BroadcastDetailPage() {
     );
   }
 
-  const status = getBroadcastStatus(broadcast.status);
-
   const pendingCount = recipients.filter((r) => r.status === 'pending').length;
   const retryableCount = recipients.filter((r) => r.status === 'failed').length;
+  const status = getBroadcastStatus(broadcast.status, {
+    total: broadcast.total_recipients,
+    sent: broadcast.sent_count,
+    failed: broadcast.failed_count,
+  });
   // A campaign whose tab went away sits in 'sending' with recipients
   // still pending and nothing left to move them. Name that state rather
   // than leaving a permanently pulsing "sending" badge.

@@ -233,7 +233,11 @@ export default function BroadcastsPage() {
             </TableHeader>
             <TableBody>
               {broadcasts.map((broadcast) => {
-                const status = getBroadcastStatus(broadcast.status);
+                const status = getBroadcastStatus(broadcast.status, {
+                  total: broadcast.total_recipients,
+                  sent: broadcast.sent_count,
+                  failed: broadcast.failed_count,
+                });
                 return (
                   <TableRow
                     key={broadcast.id}

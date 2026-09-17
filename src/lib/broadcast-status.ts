@@ -74,12 +74,29 @@ export const recipientStatusConfig: Record<RecipientStatus, StatusDisplay> = {
   },
 };
 
+export interface BroadcastStatusCounts {
+  total: number;
+  sent: number;
+  failed: number;
+}
+
 /**
  * Tolerant lookup — callers often have a generic string status
  * coming from Supabase. Falls back to the "draft" / "pending"
  * entry so the UI never crashes on an unknown value.
  */
-export function getBroadcastStatus(status: string): StatusDisplay {
+export function getBroadcastStatus(
+  status: string,
+  counts?: BroadcastStatusCounts,
+): StatusDisplay {
+  if (
+    status === "sending" &&
+    counts &&
+    counts.sent + counts.failed >= counts.total
+  ) {
+    return broadcastStatusConfig.sent;
+  }
+
   return (
     broadcastStatusConfig[status as BroadcastStatus] ??
     broadcastStatusConfig.draft
