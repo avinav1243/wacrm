@@ -90,6 +90,10 @@ npm run dev
 Open <http://localhost:3000>. You'll be redirected to `/login` (or
 `/dashboard` if already signed in).
 
+The UI ships in English, Korean, Brazilian Portuguese and Spanish — set
+`NEXT_PUBLIC_APP_LOCALE` to `en`, `ko`, `pt` or `es` in `.env.local`
+(catalogues live in `messages/`).
+
 Prefer containers? See [docs/docker.md](./docs/docker.md) for the
 Dockerfile + Docker Compose setup.
 
@@ -154,6 +158,11 @@ Key pages:
 - [Deploy on Hostinger](https://wacrm.tech/docs/deployment-hostinger)
 - [Architecture](https://wacrm.tech/docs/architecture)
 - [Troubleshooting](https://wacrm.tech/docs/troubleshooting)
+- [WhatsApp connection troubleshooting](./docs/whatsapp-connection-troubleshooting.md)
+  — what each "Save Configuration" error means, and the Meta code /
+  trace id to quote to Meta support
+- [Several WABAs on one deployment](./docs/multi-waba.md) — one Meta
+  App or several; how `META_APP_SECRET` takes a comma-separated list
 
 ## Stack
 

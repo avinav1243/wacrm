@@ -153,9 +153,12 @@ export async function findOrCreateContact(
 
 /**
  * Replace a contact's tags to exactly match `tagNames` (case-
- * insensitive; missing tags are created). A no-op when `tagNames` is
- * undefined — pass `[]` to clear all tags. Reuses `resolveImportTagIds`
- * so API and CSV-import tag handling stay consistent.
+ * insensitive; missing tags are created). Pass `[]` to clear all tags.
+ * Reuses `resolveImportTagIds` so API and CSV-import tag handling stay
+ * consistent — but note its `tagIdByKey` map holds EVERY tag in the
+ * account (it loads them all for case-insensitive matching), so the
+ * desired set must be derived from the *requested* names only, never
+ * from the map's values (#560).
  */
 export async function setContactTags(
   db: SupabaseClient,
@@ -170,7 +173,15 @@ export async function setContactTags(
     tagNames,
     canCreateTags: true,
   });
-  const desired = new Set(tagIdByKey.values());
+  // Same normalization `resolveImportTagIds` applies to `tagNames`
+  // (trim, lowercase, skip empty) so every requested name resolves.
+  const desired = new Set<string>();
+  for (const raw of tagNames) {
+    const key = raw.trim().toLowerCase();
+    if (!key) continue;
+    const tagId = tagIdByKey.get(key);
+    if (tagId) desired.add(tagId);
+  }
 
   // Diff against the current joins rather than delete-all-then-insert:
   // a diff only touches tags that actually change, so a mid-operation

@@ -40,7 +40,26 @@ interface MessageBubbleProps {
   onOpenMedia?: (messageId: string) => void;
 }
 
-function StatusIcon({ status }: { status: Message["status"] }) {
+/**
+ * "[title] — [details]" for a failed message, or null when the row
+ * predates migration 042 / Meta sent no reason. Shared by the status
+ * icon's tooltip and the line under the bubble.
+ */
+function failureReason(message: Message): string | null {
+  if (message.status !== "failed" || !message.error_title) return null;
+  return message.error_details
+    ? `${message.error_title} — ${message.error_details}`
+    : message.error_title;
+}
+
+function StatusIcon({
+  status,
+  title,
+}: {
+  status: Message["status"];
+  /** Tooltip for the failed state — Meta's reason, when we have one. */
+  title?: string | null;
+}) {
   switch (status) {
     case "sending":
       return <Clock className="h-3 w-3 text-muted-foreground" />;
@@ -51,7 +70,11 @@ function StatusIcon({ status }: { status: Message["status"] }) {
     case "read":
       return <CheckCheck className="h-3 w-3 text-blue-400" />;
     case "failed":
-      return <XCircle className="h-3 w-3 text-red-400" />;
+      return (
+        <span className="inline-flex" title={title ?? undefined}>
+          <XCircle className="h-3 w-3 text-red-400" />
+        </span>
+      );
     default:
       return null;
   }
@@ -227,6 +250,7 @@ export function MessageBubble({
 
   const isAgent = message.sender_type === "agent" || message.sender_type === "bot";
   const time = format(new Date(message.created_at), "HH:mm");
+  const failure = isAgent ? failureReason(message) : null;
 
   // Row alignment + width cap are owned by <MessageActions> so its hover
   // group matches the bubble's content area, not the full row.
@@ -289,9 +313,17 @@ export function MessageBubble({
           >
             {time}
           </span>
-          {isAgent && <StatusIcon status={message.status} />}
+          {isAgent && <StatusIcon status={message.status} title={failure} />}
         </div>
       </div>
+      {failure && (
+        <p
+          className="mt-0.5 px-1 text-[10px] leading-tight text-muted-foreground"
+          title={failure}
+        >
+          {t("notDelivered")}: {failure}
+        </p>
+      )}
       {reactions && reactions.length > 0 && onToggleReaction && (
         <MessageReactions
           reactions={reactions}
